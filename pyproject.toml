@@ -16,6 +16,7 @@ dependencies = [
     "httpx>=0.27",          # every provider adapter; avoids four vendor SDKs
     "redis>=5.2",           # STM + semantic cache
     "psycopg[binary]>=3.2", # pgvector LTM (the vector type lives in Postgres)
+    "qdrant-client>=1.12",  # RAG vector store; embedded local mode needs no server
 ]
 
 [project.optional-dependencies]
@@ -23,11 +24,16 @@ dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
 ]
+# Cross-encoder reranking. Kept optional because sentence-transformers pulls
+# torch (~2GB); rag/rerank.py falls back to a lexical reranker when absent.
+rerank = [
+    "sentence-transformers>=3.0",
+]
 
 [tool.setuptools]
 # Flat layout with several top-level packages, so list them rather than relying
 # on auto-discovery (which refuses to guess and picks up `db/` and `tests/`).
-packages = ["app", "agents", "gateway", "guardrails", "memory"]
+packages = ["app", "agents", "gateway", "guardrails", "memory", "rag"]
 
 [tool.setuptools.package-data]
 app = ["static/*.html"]
