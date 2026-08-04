@@ -34,7 +34,10 @@ rerank = [
 [tool.setuptools]
 # Flat layout with several top-level packages, so list them rather than relying
 # on auto-discovery (which refuses to guess and picks up `db/` and `tests/`).
-packages = ["app", "agents", "gateway", "guardrails", "memory", "rag", "redteam", "web"]
+packages = [
+    "app", "agents", "gateway", "guardrails", "memory",
+    "rag", "redteam", "web", "instrumentation", "actions",
+]
 
 [tool.setuptools.package-data]
 app = ["static/*.html"]

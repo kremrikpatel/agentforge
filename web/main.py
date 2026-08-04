@@ -341,12 +341,26 @@ async def redteam_run_failures(
     return {"run_id": run_id, "failures": await redteam_failures(run_id)}
 
 
+# Phase 5 inspection endpoints (/trajectories, /audit-log). Mounted here rather
+# than served separately so they inherit this app's session auth.
+from instrumentation.api import router as instrumentation_router  # noqa: E402
+
+app.include_router(instrumentation_router)
+
+
 @app.exception_handler(HTTPException)
 async def _json_errors(request: Request, exc: HTTPException) -> Response:
-    """Unauthenticated page loads bounce to login; API calls get JSON."""
+    """Unauthenticated page loads bounce to login; API calls get JSON.
+
+    The prefixes are listed explicitly because "not under /api/" is not the same
+    question as "is this a JSON API": the Phase 5 inspection endpoints sit at
+    /trajectories and /audit-log, and redirecting those to a login page would
+    hand an API client an HTML redirect instead of a 401.
+    """
+    json_api = ("/api/", "/trajectories", "/audit-log")
     unauthenticated_page = (
         exc.status_code == status.HTTP_401_UNAUTHORIZED
-        and not request.url.path.startswith("/api/")
+        and not request.url.path.startswith(json_api)
     )
     if unauthenticated_page:
         return RedirectResponse("/login")

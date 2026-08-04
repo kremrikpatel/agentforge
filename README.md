@@ -556,6 +556,151 @@ It is deliberately **not** an identity system. Flagged for a later phase:
 - **History covers runs triggered from the console.** Runs started directly
   against the API do not appear, because the console records them as it proxies.
 
+## Instrumentation and compliance (Phase 5)
+
+Captures what each run actually did, in a shape a future training pipeline can
+consume — with PII removed *before* anything is written down. Plus audit logging
+and versioned rollback for admin changes.
+
+**Storage: Postgres tables, not an append-only log file.** Trajectories need to be
+selected by run, outcome and reward without a parsing layer, so the training
+export is a query rather than a batch job. Append-only is enforced by
+construction — there is no UPDATE or DELETE path except the reward label, which
+is explicitly revisable (feedback can arrive an hour later) and lives apart from
+the observed steps for that reason.
+
+### PII scrubbing — where it happens, and why there
+
+Scrubbing runs **inside the store's save methods**, not in the callers.
+"Hard requirement, not best-effort" means a caller must not be *able* to persist
+raw PII, so the safe path is the only path:
+
+```python
+raw = Trajectory(run_id="r", topic="contact alex.doe@example.com")
+stored = await store.save_trajectory(raw)     # scrubbing is not optional here
+stored.topic          # 'contact [REDACTED:EMAIL]'
+stored.pii_findings   # 1
+```
+
+Detection is entirely Phase 1's `guardrails.patterns` — same regexes, same Luhn
+check on card numbers, no second implementation to drift. What this module adds
+is the recursive walk: every string in a nested structure, **including dictionary
+keys**, since a payload keyed by email address is a realistic shape.
+
+`to_training_example()` re-checks and refuses an unscrubbed trajectory, because an
+export is exactly where unscrubbed data would leave the building.
+
+**Known boundary, stated rather than hidden:** only strings are scanned. Numeric
+fields are left alone — scrubbing them would destroy latencies, confidences and
+counts to catch a case that does not occur in Phase 1 contracts, which carry
+their free text as strings.
+
+### Trajectory schema
+
+Four new tables. No Phase 1–3 table is altered.
+
+| Table | Holds |
+|---|---|
+| `trajectories` | one row per run: topic, agent config + version, status, timings, reward JSONB, `scrubbed`, `pii_findings`, `pii_categories` |
+| `trajectory_steps` | one row per step: `ordinal`, `kind`, `stage`, `name`, `input`/`output` JSONB, `latency_ms`, `success`, `error` |
+| `audit_log` | who/what/when plus `changes`, `before`, `after` JSONB |
+| `entity_versions` | immutable snapshots, unique on `(entity_type, entity_id, version)` |
+
+A step's `kind` is one of `reasoning`, `llm_call`, `tool_call`, `guardrail`,
+`handoff`, `error`. Steps are ordered as the pipeline ran: for each stage, the
+guardrail verdicts that gated it, then the agent's reasoning, its tool calls, and
+its handoff. Guardrail `allow` verdicts produce no step — an allow is the absence
+of news.
+
+Trajectories are a **projection of the Phase 1 report**, not new instrumentation
+wired into the graph. `agents/` is untouched.
+
+### Reward signals
+
+`RewardSignal` carries the implicit signals plus any explicit feedback. The score
+is a documented weighting, not a learned one — a training signal nobody can
+explain is one nobody should trust:
+
+```
+start at  stages_completed / stages_total     progress actually made
+-0.25     did not reach a completed resolution
+-0.10     per guardrail intervention, capped at two
+-0.10     per error, capped at two
+-0.15     escalated (an agent raised a blocking question)
+-0.10     a human had to intervene
+```
+
+`human_intervention` is not inferred — it is passed in by whatever knows a human
+acted (for example a Text2SQL approval). Explicit user feedback arrives later via
+`POST /trajectories/{run_id}/feedback` and outranks the heuristic.
+
+### Mapping to training export
+
+`to_training_example()` flattens a stored trajectory into `TrainingExample`
+(`schema_version` `1.0`), the unit a future fine-tuning or RL pipeline consumes:
+
+| Trajectory | maps to | TrainingExample |
+|---|---|---|
+| `topic` (scrubbed) | → | `instruction` |
+| each step | → | a `turn` — `reasoning`/`llm_call`/`handoff` become `assistant`, `tool_call` becomes `tool`, `guardrail` becomes `guardrail` |
+| `step.input` / `step.output` | → | `turn.tool_input` / `turn.tool_output` |
+| `reward.resolution` | → | `outcome` |
+| `reward.implicit_score` | → | `reward` (the scalar to optimise) |
+| `reward` (whole) | → | `reward_components`, so a trainer can re-weight without re-exporting |
+| config id/version, status, timings | → | `metadata` |
+
+`pii_scrubbed: true` travels with the exported record — the guarantee has to move
+with the data, not stay behind in the database.
+
+### Audit logging
+
+Every version write emits an audit entry with a **structural** diff, so a reviewer
+sees `stages[0].instructions` named rather than a unified diff of pretty-printed
+JSON. Lists are compared position-wise, so a one-word edit does not report as
+"everything changed".
+
+### Versioning and rollback
+
+Rollback appends a **new** version carrying an older payload rather than deleting
+what came between — erasing the record of what was briefly live is precisely the
+question an incident review asks. The new version records `rolled_back_from`.
+
+```python
+registry = ActionRegistry(VersionStore(store))
+await registry.register(action, actor="admin")              # v1
+await registry.update(edited, actor="admin")                # v2
+await registry.rollback("create_ticket", 1, actor="admin")  # v3, payload of v1
+await registry.at_version("create_ticket", 2)               # v2 still readable
+```
+
+Rolling back to a version that does not exist raises `VersionNotFound` rather
+than quietly doing nothing.
+
+### Endpoints
+
+Mounted into the Phase 4 console so they inherit its session auth — all require a
+signed-in admin.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /trajectories` | recent runs with outcome and reward |
+| `GET /trajectories/{run_id}` | the full trajectory, steps included |
+| `GET /trajectories/{run_id}/export` | the `TrainingExample` projection |
+| `POST /trajectories/{run_id}/feedback` | records explicit feedback |
+| `GET /audit-log` | audit entries, filterable by `entity_type`, `entity_id`, `actor`, `action` |
+
+### Known limits
+
+- **`actions/` is definition and versioning only.** It did not exist before this
+  phase; there is no dispatch, retry, or schema-validation runtime, and nothing
+  registered here is invoked. That is a later phase.
+- **Recording is not yet wired into the run path.** `TrajectoryRecorder.record()`
+  takes a finished `PipelineReport`; calling it automatically on every run means
+  editing Phase 1 or the Phase 4 run endpoint, which this phase's scope excludes.
+- **Agent-config versioning is available but not yet called by the console.**
+  Phase 4's config endpoints predate this store; wiring them to `VersionStore`
+  is a small change to `web/main.py` left for whoever owns that surface next.
+
 ## Deliberate Phase 1 simplifications
 
 Each is marked with a `ponytail:` comment at its site, naming the ceiling and the
@@ -598,8 +743,10 @@ rag/        chunking + Qdrant store, BM25/FTS lexical index, reranking,
             HyDE, CRAG, Self-RAG, Text2SQL, and the retrieve() pipeline
 redteam/    attack corpus, PyRIT targets, scoring, threshold gate, dashboard
 web/        admin console: session auth, agent configs, run history, BFF, UI
+instrumentation/  trajectory capture, PII scrubbing, audit log, versioning
+actions/    versioned action definitions (no execution runtime yet)
 tests/      graph routing, gateway fallback, guardrails, memory, retrieval,
-            red team, console API
+            red team, console API, instrumentation
 db/         initial pgvector schema
 ```
 
