@@ -17,6 +17,7 @@ dependencies = [
     "redis>=5.2",           # STM + semantic cache
     "psycopg[binary]>=3.2", # pgvector LTM (the vector type lives in Postgres)
     "qdrant-client>=1.12",  # RAG vector store; embedded local mode needs no server
+    "pyrit>=1.0.1",         # red-team attack orchestration (Phase 3)
 ]
 
 [project.optional-dependencies]
@@ -33,10 +34,12 @@ rerank = [
 [tool.setuptools]
 # Flat layout with several top-level packages, so list them rather than relying
 # on auto-discovery (which refuses to guess and picks up `db/` and `tests/`).
-packages = ["app", "agents", "gateway", "guardrails", "memory", "rag"]
+packages = ["app", "agents", "gateway", "guardrails", "memory", "rag", "redteam", "web"]
 
 [tool.setuptools.package-data]
 app = ["static/*.html"]
+redteam = ["static/*.html"]
+web = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 # Flat top-level packages (app, agents, gateway, memory, guardrails) resolve from

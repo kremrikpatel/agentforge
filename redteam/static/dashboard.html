@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AgentForge — Red Team</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --ink:#e6edf3; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line);
+           display:flex; gap:14px; align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; font-weight:650; }
+  h1 span { color:var(--dim); font-weight:400; }
+  select { font:inherit; background:#0b0f14; color:var(--ink);
+           border:1px solid var(--line); border-radius:7px; padding:7px 10px; }
+  .status { font-size:12px; color:var(--dim); margin-left:auto; }
+  main { padding:22px 24px; display:grid; gap:20px; }
+  .cards { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-top:3px solid var(--line); border-radius:10px; padding:14px; }
+  .card.ok { border-top-color:var(--ok); } .card.warn { border-top-color:var(--warn); }
+  .card.bad { border-top-color:var(--bad); }
+  .card h2 { margin:0 0 8px; font-size:12px; text-transform:uppercase;
+             letter-spacing:.7px; color:var(--dim); font-weight:600; }
+  .rate { font-size:30px; font-weight:680; letter-spacing:-.5px; }
+  .rate.ok { color:var(--ok); } .rate.warn { color:var(--warn); } .rate.bad { color:var(--bad); }
+  .meta { font-size:11.5px; color:var(--dim); margin-top:7px; }
+  .delta { font-size:11.5px; margin-top:5px; font-weight:600; }
+  .up { color:var(--ok); } .down { color:var(--bad); } .flat { color:var(--dim); }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+  .panel h3 { margin:0; padding:11px 14px; font-size:12px; text-transform:uppercase;
+              letter-spacing:.7px; color:var(--dim); border-bottom:1px solid var(--line); }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:8px 14px; border-bottom:1px solid #21262d; }
+  th { color:var(--dim); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  tr:last-child td { border-bottom:0; }
+  .pill { font-size:10.5px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); }
+  .pill.blocked { color:var(--ok); border-color:#1c5c2e; }
+  .pill.refused { color:var(--accent); border-color:#1f4468; }
+  .pill.leaked { color:var(--bad); border-color:#6e2a26; }
+  .pill.error { color:var(--dim); }
+  details { border-bottom:1px solid #21262d; }
+  details:last-child { border-bottom:0; }
+  summary { padding:9px 14px; cursor:pointer; font-size:12.5px; }
+  summary::marker { color:var(--dim); }
+  pre { margin:0; padding:12px 14px; background:#0b0f14; font-size:11.5px;
+        white-space:pre-wrap; word-break:break-word; max-height:280px;
+        overflow:auto; color:#a5d6ff; }
+  .empty { padding:22px 14px; color:var(--dim); font-size:13px; }
+  .lbl { color:var(--dim); font-size:11px; text-transform:uppercase;
+         letter-spacing:.5px; padding:10px 14px 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AgentForge <span>· red team</span></h1>
+  <select id="runs"></select>
+  <span class="status" id="status">loading…</span>
+</header>
+
+<main>
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h3>Failing transcripts</h3>
+    <div id="failures"><div class="empty">—</div></div>
+  </div>
+
+  <div class="panel">
+    <h3>All attempts</h3>
+    <table>
+      <thead>
+        <tr><th>Category</th><th>Objective</th><th>Outcome</th><th>Guardrail</th><th>Turns</th></tr>
+      </thead>
+      <tbody id="attempts"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+const esc = t => String(t ?? "").replace(/[<>&]/g, c => ({ "<":"&lt;", ">":"&gt;", "&":"&amp;" }[c]));
+const pct = v => (v == null ? "—" : (v * 100).toFixed(1) + "%");
+const runsEl = document.getElementById("runs");
+const statusEl = document.getElementById("status");
+
+// Matches the runner's default threshold; amber marks "held, but not comfortably".
+const THRESHOLD = 0.9;
+function band(rate) { return rate >= THRESHOLD ? "ok" : rate >= 0.7 ? "warn" : "bad"; }
+
+async function loadRuns() {
+  const { runs } = await (await fetch("/api/runs")).json();
+  if (!runs.length) {
+    statusEl.textContent = "no runs recorded yet — run `python -m redteam.runner`";
+    return;
+  }
+  runsEl.innerHTML = runs.map(r =>
+    `<option value="${esc(r.run_id)}">${esc(String(r.started_at).slice(0,19))} · ${esc(r.target)}</option>`
+  ).join("");
+  runsEl.onchange = () => loadRun(runsEl.value);
+  loadRun(runs[0].run_id);
+}
+
+async function loadRun(runId) {
+  const d = await (await fetch(`/api/runs/${runId}`)).json();
+  const run = d.run;
+  const trend = Object.fromEntries((d.trend || []).map(t => [t.category, t]));
+
+  statusEl.textContent =
+    `${run.total} attempts · overall ${pct(run.block_rate)}` +
+    (d.previous_run_id ? ` · vs ${d.previous_run_id.slice(0,8)}` : " · first run for this target");
+
+  document.getElementById("cards").innerHTML = (run.categories || []).map(c => {
+    const t = trend[c.category];
+    let delta = '<div class="delta flat">no previous run</div>';
+    if (t && t.delta != null) {
+      const cls = t.delta > 0 ? "up" : t.delta < 0 ? "down" : "flat";
+      const arrow = t.delta > 0 ? "▲" : t.delta < 0 ? "▼" : "＝";
+      delta = `<div class="delta ${cls}">${arrow} ${(t.delta*100).toFixed(1)} pts vs previous</div>`;
+    }
+    return `<div class="card ${band(c.block_rate)}">
+      <h2>${esc(c.category)}</h2>
+      <div class="rate ${band(c.block_rate)}">${pct(c.block_rate)}</div>
+      <div class="meta">blocked ${c.blocked} · refused ${c.refused} ·
+                       leaked ${c.leaked} · errors ${c.errors}</div>
+      <div class="meta">guardrails alone: ${pct(c.guardrail_block_rate)}</div>
+      ${delta}</div>`;
+  }).join("");
+
+  const failures = d.failures || [];
+  document.getElementById("failures").innerHTML = failures.length
+    ? failures.map(f => `<details>
+        <summary><span class="pill leaked">leaked</span> ${esc(f.category)} — ${esc(f.objective)}</summary>
+        <div class="lbl">Attack prompt</div><pre>${esc(f.prompt)}</pre>
+        <div class="lbl">Evidence</div><pre>${esc(f.judge_evidence || "—")}</pre>
+        <div class="lbl">Response</div><pre>${esc((f.response || "").slice(0, 4000))}</pre>
+      </details>`).join("")
+    : '<div class="empty">No leaks in this run — every attack was blocked or refused.</div>';
+
+  document.getElementById("attempts").innerHTML = (d.attempts || []).map(a =>
+    `<tr>
+       <td>${esc(a.category)}</td>
+       <td>${esc((a.objective || "").slice(0, 90))}</td>
+       <td><span class="pill ${esc(a.outcome)}">${esc(a.outcome)}</span></td>
+       <td>${esc(a.guardrail_action || "—")}</td>
+       <td>${esc(a.turns)}</td>
+     </tr>`).join("");
+}
+
+loadRuns().catch(e => { statusEl.textContent = "failed to load: " + e; });
+</script>
+</body>
+</html>

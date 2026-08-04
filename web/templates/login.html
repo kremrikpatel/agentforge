@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AgentForge Console — Sign in</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body class="centered">
+  <form class="card login" id="form" autocomplete="on">
+    <h1>AgentForge <span>Console</span></h1>
+
+    {% if not configured %}
+    <p class="notice bad">
+      Admin auth is not configured. Set <code>WEB_ADMIN_PASSWORD</code> and restart —
+      every sign-in is refused until you do.
+    </p>
+    {% endif %}
+
+    <label for="username">User</label>
+    <input id="username" name="username" autocomplete="username" value="admin" required />
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required />
+
+    <button type="submit" id="submit">Sign in</button>
+    <p class="error" id="error" hidden></p>
+  </form>
+
+<script>
+const form = document.getElementById("form");
+const errorEl = document.getElementById("error");
+
+form.onsubmit = async (e) => {
+  e.preventDefault();
+  errorEl.hidden = true;
+  document.getElementById("submit").disabled = true;
+  try {
+    const res = await fetch("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value,
+      }),
+    });
+    if (res.ok) { window.location = "/app"; return; }
+    const body = await res.json().catch(() => ({}));
+    errorEl.textContent = body.detail || `Sign-in failed (${res.status})`;
+    errorEl.hidden = false;
+  } catch (err) {
+    errorEl.textContent = String(err);
+    errorEl.hidden = false;
+  } finally {
+    document.getElementById("submit").disabled = false;
+  }
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AgentForge Console</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">AgentForge <span>Console</span></div>
+    <nav>
+      <button class="nav active" data-panel="run">Run</button>
+      <button class="nav" data-panel="history">History</button>
+      <button class="nav" data-panel="agent">Agent</button>
+      <button class="nav" data-panel="knowledge">Knowledge</button>
+      <button class="nav" data-panel="redteam">Red team</button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="who">{{ user }}</div>
+      <div class="health" id="health">checking…</div>
+      <button class="link" id="logout">Sign out</button>
+    </div>
+  </aside>
+
+  <main>
+    <!-- Run: chat-style topic entry with live per-stage progress -->
+    <section class="panel active" data-panel="run">
+      <header><h2>Run a pipeline</h2><span class="status" id="run-status"></span></header>
+      <div class="stages" id="stages">
+        {% for stage in stages %}
+        <div class="stage" data-stage="{{ stage }}">
+          <div class="stage-name">{{ stage }}</div>
+          <div class="stage-state" data-state>waiting</div>
+          <div class="stage-summary" data-summary></div>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="feed" id="feed"></div>
+      <form class="composer" id="run-form">
+        <select id="run-config"><option value="">No agent config</option></select>
+        <textarea id="topic" rows="2" required
+          placeholder="Describe the task, e.g. Design a rate limiter for a public REST API"></textarea>
+        <button type="submit" id="run-go">Run</button>
+      </form>
+    </section>
+
+    <!-- History -->
+    <section class="panel" data-panel="history">
+      <header><h2>Past runs</h2><button class="link" id="history-refresh">Refresh</button></header>
+      <table class="grid">
+        <thead><tr>
+          <th>Started</th><th>Topic</th><th>Status</th><th>Stages</th>
+          <th>Guardrails</th><th>Config</th>
+        </tr></thead>
+        <tbody id="history-rows"></tbody>
+      </table>
+      <div id="run-detail"></div>
+    </section>
+
+    <!-- Agent configuration -->
+    <section class="panel" data-panel="agent">
+      <header>
+        <h2>Agent configuration</h2>
+        <span class="status"><select id="config-picker"></select></span>
+        <button class="link" id="config-new">New</button>
+      </header>
+      <p class="notice">
+        Instructions persist here but do <strong>not</strong> yet change pipeline
+        behaviour — the running prompts are constants in <code>agents/nodes.py</code>,
+        which this phase does not modify. Same for actions: there is no actions
+        runtime yet, so they are stored as configuration only.
+      </p>
+      <div class="form">
+        <label>Name</label><input id="config-name" />
+        <label>Description</label><textarea id="config-description" rows="2"></textarea>
+      </div>
+      <div id="stage-editors"></div>
+      <div class="form">
+        <label>Knowledge bases <small>(comma-separated kb ids)</small></label>
+        <input id="config-knowledge" placeholder="handbook, runbooks" />
+        <label>Actions <small>(one per line: name | METHOD | endpoint)</small></label>
+        <textarea id="config-actions" rows="3"
+                  placeholder="create_ticket | POST | https://api.example.test/tickets"></textarea>
+      </div>
+      <button id="config-save">Save configuration</button>
+      <span class="status" id="config-status"></span>
+    </section>
+
+    <!-- Knowledge ingestion -->
+    <section class="panel" data-panel="knowledge">
+      <header><h2>Knowledge base</h2></header>
+      <p class="notice">Documents are chunked, embedded and indexed by the Phase 2 RAG pipeline.</p>
+      <div class="form">
+        <label>Knowledge base id</label><input id="kb-id" placeholder="handbook" />
+        <label>Title</label><input id="kb-title" placeholder="Rate limiting" />
+        <label>Source</label><input id="kb-source" placeholder="docs/rate-limiting.md" />
+        <label>Document text</label><textarea id="kb-text" rows="10"></textarea>
+      </div>
+      <button id="kb-ingest">Ingest document</button>
+      <span class="status" id="kb-status"></span>
+    </section>
+
+    <!-- Red team (Phase 3 data) -->
+    <section class="panel" data-panel="redteam">
+      <header>
+        <h2>Red team</h2>
+        <a class="link" href="{{ redteam_url }}" target="_blank" rel="noopener">
+          Full dashboard &#8599;
+        </a>
+      </header>
+      <div class="cards" id="rt-cards"></div>
+      <div id="rt-failures"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
