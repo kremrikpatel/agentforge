@@ -1,0 +1,29 @@
+apiVersion: v2
+name: agentforge
+description: >-
+  AgentForge: multi-agent pipeline API, admin console, scheduled red-team suite,
+  and optional in-cluster Redis / Postgres(pgvector) / Qdrant.
+type: application
+
+# Chart version moves with the chart; appVersion tracks the application and is
+# the default image tag, so `helm upgrade --set image.tag=` is only needed when
+# deploying something other than the released version.
+version: 0.1.0
+appVersion: "0.1.0"
+
+# Vanilla Kubernetes 1.28+. Uses apps/v1, autoscaling/v2, networking.k8s.io/v1
+# and batch/v1 only -- no cloud-specific CRDs.
+kubeVersion: ">=1.28.0-0"
+
+keywords:
+  - llm
+  - agents
+  - rag
+home: https://example.invalid/agentforge
+maintainers:
+  - name: AgentForge maintainers
+
+# No dependencies on purpose. The datastores are in-chart StatefulSets behind
+# `enabled` toggles rather than subcharts: subcharts require `helm dep update`
+# (and network access) before the chart will even template, and they pin you to
+# their own value schema. Switching to a managed datastore here is one flag.

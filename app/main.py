@@ -16,6 +16,7 @@ from agents.graph import build_graph, initial_state, to_report
 from agents.nodes import AgentDeps
 from app.config import get_settings
 from app.observability import EVENT_BUS, configure_logging, get_logger, log_event, timed
+from app.tracing import configure_tracing, set_attributes, shutdown_tracing, span
 from gateway.client import LLMGateway
 from guardrails.engine import GuardrailEngine
 from memory.cache import SemanticCache
@@ -30,6 +31,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    # No-op unless OTEL_ENABLED and at least one backend credential are present.
+    configure_tracing(service_name="agentforge-api")
 
     gateway = LLMGateway(settings)
     app.state.settings = settings
@@ -63,6 +66,7 @@ async def lifespan(app: FastAPI):
         await gateway.aclose()
         await app.state.stm.aclose()
         await app.state.cache.aclose()
+        shutdown_tracing()   # flush any spans still batched
 
 
 app = FastAPI(
@@ -115,9 +119,29 @@ async def run_pipeline(req: PipelineRequest, request: Request) -> PipelineReport
                 await state.cache.invalidate(req.topic)
 
     EVENT_BUS.publish(run_id, {"type": "run_start", "run_id": run_id, "topic": req.topic})
-    with timed() as t:
+    with span(
+        "agentforge.pipeline.run",
+        **{
+            "agentforge.run_id": run_id,
+            "agentforge.session_id": req.session_id,
+            "gen_ai.system": "agentforge",
+            "gen_ai.operation.name": "chain",
+        },
+    ) as run_span, timed() as t:
         final = await state.graph.ainvoke(initial_state(run_id, req.session_id, req.topic))
-    report = to_report(final)
+        report = to_report(final)
+        set_attributes(
+            run_span,
+            **{
+                "agentforge.status": report.status,
+                "agentforge.stages_completed": sum(
+                    1 for s in (report.analysis, report.develop, report.test, report.deploy) if s
+                ),
+                "agentforge.guardrail_reports": len(report.guardrail_reports),
+                "agentforge.errors": len(report.errors),
+                "agentforge.latency_ms": report.total_latency_ms,
+            },
+        )
 
     if report.status == "completed":
         await state.cache.set(req.topic, report.model_dump(mode="json"))

@@ -1,0 +1,17 @@
+# BuildKit reads <dockerfile>.dockerignore, which keeps this inside deploy/
+# instead of adding a file at the repository root.
+# Without it the build context includes .venv (multiple GB) on every build.
+.venv/
+venv/
+.git/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+tests/
+deploy/
+prompts/
+.env

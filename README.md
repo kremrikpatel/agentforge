@@ -701,6 +701,45 @@ signed-in admin.
   Phase 4's config endpoints predate this store; wiring them to `VersionStore`
   is a small change to `web/main.py` left for whoever owns that surface next.
 
+## Production deployment (Phase 6)
+
+Docker images and a Helm chart for Kubernetes **1.28+**, with OpenTelemetry
+tracing to LangSmith, LangWatch and Arize. Full runbook — build, install,
+rollback, dashboards, troubleshooting — in **[deploy/README.md](deploy/README.md)**.
+
+```bash
+docker build -f deploy/docker/api.Dockerfile -t agentforge-api:0.1.0 .
+```
+
+```bash
+helm install agentforge deploy/helm/agentforge -n agentforge -f deploy/helm/agentforge/values-prod.yaml
+```
+
+Three images (API, console, red-team worker), all multi-stage and non-root at uid
+10001. Only the red-team image installs the `redteam` extra, so PyRIT's ~44
+packages stay out of the API and console images.
+
+One chart covers both Deployments plus their Services, the API's HPA and PDB, the
+red-team **CronJob** (a batch run with a meaningful exit code, not a Deployment),
+Ingress, a ConfigMap, and optional in-cluster Redis / Postgres(pgvector) / Qdrant
+StatefulSets. `values-dev.yaml` runs everything in-cluster; `values-prod.yaml`
+switches the datastores off and points at managed services.
+
+**No credential appears in the chart or any values file.** Secrets are referenced
+by key name from a Secret you create out of band. `POSTGRES_DSN` and `REDIS_URL`
+are secrets in full so the chart never composes a connection string from a
+password.
+
+**Tracing is one OTLP pipeline with three destinations** — LangSmith, LangWatch
+and Arize all ingest OTLP, so there are no vendor SDKs. It is off unless
+`OTEL_ENABLED=true` and a backend key is present; with it off, `span()` is a
+genuine no-op. Hooks live in `app/main.py` (one span per run) and
+`agents/nodes.py` (one per agent), both as wrappers that leave the existing logic
+untouched.
+
+**Local development is unchanged** — `docker compose up` still works exactly as
+in Phase 1.
+
 ## Deliberate Phase 1 simplifications
 
 Each is marked with a `ponytail:` comment at its site, naming the ceiling and the
@@ -745,8 +784,9 @@ redteam/    attack corpus, PyRIT targets, scoring, threshold gate, dashboard
 web/        admin console: session auth, agent configs, run history, BFF, UI
 instrumentation/  trajectory capture, PII scrubbing, audit log, versioning
 actions/    versioned action definitions (no execution runtime yet)
+deploy/     Dockerfiles per service + Helm chart (K8s 1.28+) + runbook
 tests/      graph routing, gateway fallback, guardrails, memory, retrieval,
-            red team, console API, instrumentation
+            red team, console API, instrumentation, tracing
 db/         initial pgvector schema
 ```
 

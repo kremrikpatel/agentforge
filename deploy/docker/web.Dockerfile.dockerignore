@@ -1,0 +1,16 @@
+# See api.Dockerfile.dockerignore -- same exclusions, per-Dockerfile so nothing
+# has to be added at the repository root.
+.venv/
+venv/
+.git/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+tests/
+deploy/
+prompts/
+.env

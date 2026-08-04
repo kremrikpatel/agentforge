@@ -25,6 +25,7 @@ from agents.contracts import (
 )
 from app.jsonio import extract_json
 from app.observability import EVENT_BUS, get_logger, log_event, timed
+from app.tracing import set_attributes, span
 from gateway.client import AllProvidersFailed, LLMGateway
 from gateway.providers import GatewayRequest
 from guardrails.engine import GuardrailEngine
@@ -448,5 +449,37 @@ def make_node(stage: Stage, deps: AgentDeps):
             "halted": bool(contract.handoff.blocking),
         }
 
-    node.__name__ = f"{stage.value}_node"
-    return node
+    async def traced_node(state: dict) -> dict:
+        """Tracing wrapper.
+
+        Wraps `node` rather than editing it, so the agent's control flow is
+        untouched and telemetry cannot alter what it returns.
+        """
+        with span(
+            f"agentforge.agent.{stage.value}",
+            **{
+                "agentforge.stage": stage.value,
+                "agentforge.agent": agent_name,
+                "agentforge.run_id": state.get("run_id", ""),
+                "gen_ai.system": "agentforge",
+                "gen_ai.operation.name": "agent",
+            },
+        ) as node_span:
+            result = await node(state)
+            trace_row = (result.get("traces") or [{}])[0]
+            set_attributes(
+                node_span,
+                **{
+                    "gen_ai.request.model": trace_row.get("model") or None,
+                    "agentforge.provider": trace_row.get("provider") or None,
+                    "agentforge.latency_ms": trace_row.get("latency_ms"),
+                    "agentforge.success": trace_row.get("success"),
+                    "agentforge.guardrail_input": trace_row.get("guardrail_input"),
+                    "agentforge.guardrail_output": trace_row.get("guardrail_output"),
+                    "agentforge.halted": bool(result.get("halted")),
+                },
+            )
+            return result
+
+    traced_node.__name__ = f"{stage.value}_node"
+    return traced_node

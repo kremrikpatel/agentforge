@@ -1,0 +1,81 @@
+# Development / staging overrides.
+#   helm install agentforge deploy/helm/agentforge -f deploy/helm/agentforge/values-dev.yaml
+#
+# Everything in-cluster, one replica each, no autoscaling. Still no credentials
+# here -- create the Secret out of band exactly as in production.
+
+image:
+  pullPolicy: Always      # dev tags get rebuilt in place
+
+config:
+  LOG_LEVEL: "DEBUG"
+  APP_ENV: "development"
+  GUARDRAILS_LLM_TIER: "false"   # keep the judge off the dev token budget
+  WEB_COOKIE_SECURE: "false"     # dev ingress is often plain http
+
+tracing:
+  enabled: true
+  serviceName: agentforge-api-dev
+  langsmithProject: agentforge-dev
+
+api:
+  replicaCount: 1
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+  autoscaling:
+    enabled: false
+  podDisruptionBudget:
+    enabled: false          # a single replica cannot satisfy one anyway
+
+web:
+  replicaCount: 1
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+redteam:
+  enabled: true
+  schedule: "0 * * * *"     # hourly: dev is where regressions should surface
+  attemptsPerCategory: "2"  # a smoke run, not the whole corpus
+  blockRateMin: "0.8"
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {cpu: "1", memory: 2Gi}
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: agentforge.dev.internal
+      paths:
+        - {path: /, pathType: Prefix, service: web}
+        - {path: /pipeline, pathType: Prefix, service: api}
+        - {path: /health, pathType: Prefix, service: api}
+  tls: []
+
+postgres:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 5Gi
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+redis:
+  enabled: true
+  persistence:
+    enabled: false
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+
+qdrant:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 5Gi
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {cpu: "1", memory: 2Gi}

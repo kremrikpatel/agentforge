@@ -1,0 +1,107 @@
+# Production overrides.
+#   helm install agentforge deploy/helm/agentforge -f deploy/helm/agentforge/values-prod.yaml
+#
+# The key difference from dev is that the datastores are OFF: production points
+# at managed Postgres / Redis / Qdrant. The in-chart StatefulSets are a
+# single-replica convenience with no HA, backups, or failover, which is fine for
+# staging and not fine for production data.
+#
+# Connection strings live in the Secret (POSTGRES_DSN, REDIS_URL, QDRANT_API_KEY)
+# because they embed credentials. Nothing sensitive appears in this file.
+
+image:
+  pullPolicy: IfNotPresent   # prod deploys immutable, digest-pinned tags
+
+config:
+  LOG_LEVEL: "INFO"
+  APP_ENV: "production"
+  ALLOW_STUB_PROVIDER: "false"   # a placeholder answer must never reach a user
+  GUARDRAILS_LLM_TIER: "true"
+  WEB_COOKIE_SECURE: "true"
+
+tracing:
+  enabled: true
+  serviceName: agentforge-api
+  langsmithProject: agentforge-prod
+
+api:
+  replicaCount: 3          # floor when autoscaling is disabled
+  resources:
+    requests: {cpu: 500m, memory: 1Gi}
+    limits: {cpu: "4", memory: 4Gi}
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 30
+    targetCPUUtilizationPercentage: 65
+    targetMemoryUtilizationPercentage: 75
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  # Spread replicas across nodes so one node loss is not an outage.
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: agentforge
+                app.kubernetes.io/component: api
+
+web:
+  replicaCount: 2
+  resources:
+    requests: {cpu: 200m, memory: 512Mi}
+    limits: {cpu: "2", memory: 2Gi}
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: agentforge
+                app.kubernetes.io/component: web
+
+redteam:
+  enabled: true
+  schedule: "0 3 * * *"
+  attemptsPerCategory: "0"    # whole corpus
+  blockRateMin: "0.95"        # tighter bar than dev
+  # MUST stay a staging endpoint. Attacking production is the thing this whole
+  # subsystem is built to avoid, and redteam/safety.py refuses it regardless.
+  targetUrl: "http://agentforge-staging-api.agentforge-staging.svc.cluster.local:8000"
+  resources:
+    requests: {cpu: 500m, memory: 2Gi}
+    limits: {cpu: "4", memory: 6Gi}
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: agentforge.example.com
+      paths:
+        - {path: /, pathType: Prefix, service: web}
+        - {path: /pipeline, pathType: Prefix, service: api}
+        - {path: /health, pathType: Prefix, service: api}
+  tls:
+    - secretName: agentforge-tls
+      hosts:
+        - agentforge.example.com
+
+# --- managed datastores ----------------------------------------------------
+# Off in-cluster; the app reaches the managed services through the Secret.
+postgres:
+  enabled: false
+redis:
+  enabled: false
+qdrant:
+  enabled: false

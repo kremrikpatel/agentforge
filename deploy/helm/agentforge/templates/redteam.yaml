@@ -1,0 +1,60 @@
+{{- if .Values.redteam.enabled }}
+# A CronJob, not a Deployment: the suite is a batch run that exits with a status
+# code (0 held / 1 below threshold / 2 failed / 3 unsafe target). A Deployment
+# would restart it forever and the exit code would mean nothing.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "agentforge.fullname" . }}-redteam
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redteam
+spec:
+  schedule: {{ .Values.redteam.schedule | quote }}
+  concurrencyPolicy: {{ .Values.redteam.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.redteam.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.redteam.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.redteam.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.redteam.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "agentforge.labels" . | nindent 12 }}
+            app.kubernetes.io/component: redteam
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "agentforge.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext: {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: redteam
+              image: {{ include "agentforge.image" (dict "ctx" . "image" .Values.redteam.image) }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext: {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              {{- with .Values.redteam.args }}
+              args: {{- toYaml . | nindent 16 }}
+              {{- end }}
+              envFrom: {{- include "agentforge.envFrom" . | nindent 16 }}
+              env:
+                # Defaults to this release's own API service, which is a
+                # staging-shaped in-cluster name. redteam/safety.py refuses
+                # anything production-shaped whatever is set here.
+                - name: REDTEAM_TARGET_URL
+                  value: {{ .Values.redteam.targetUrl | default (printf "http://%s-api:%v" (include "agentforge.fullname" .) .Values.api.service.port) | quote }}
+                - name: REDTEAM_ALLOWED_HOSTS
+                  value: {{ printf "%s-api" (include "agentforge.fullname" .) | quote }}
+                - name: REDTEAM_BLOCK_RATE_MIN
+                  value: {{ .Values.redteam.blockRateMin | quote }}
+                - name: REDTEAM_ATTEMPTS
+                  value: {{ .Values.redteam.attemptsPerCategory | quote }}
+                - name: REDTEAM_PERSIST
+                  value: "true"
+                {{- include "agentforge.derivedEnv" . | nindent 16 }}
+              resources: {{- toYaml .Values.redteam.resources | nindent 16 }}
+              volumeMounts: {{- include "agentforge.tmpMount" . | nindent 16 }}
+          volumes: {{- include "agentforge.tmpVolume" . | nindent 12 }}
+{{- end }}

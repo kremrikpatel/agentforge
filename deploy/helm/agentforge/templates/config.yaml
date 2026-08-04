@@ -1,0 +1,46 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "agentforge.serviceAccountName" . }}
+  labels: {{- include "agentforge.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: false
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agentforge.fullname" . }}-config
+  labels: {{- include "agentforge.labels" . | nindent 4 }}
+data:
+  {{- range $key, $value := .Values.config }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- if .Values.secrets.createPlaceholder }}
+---
+# PLACEHOLDER ONLY -- every value is empty.
+#
+# Rendered so `kubectl edit secret` has the right keys to fill in. It is off by
+# default because a `helm upgrade` would overwrite real values with these empty
+# ones. In any environment you care about, create the Secret out of band and
+# leave secrets.createPlaceholder=false:
+#
+#   kubectl create secret generic {{ .Values.secrets.existingSecret }} \
+#     --from-literal=ANTHROPIC_API_KEY=... --from-literal=POSTGRES_DSN=...
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Values.secrets.existingSecret }}
+  labels: {{- include "agentforge.labels" . | nindent 4 }}
+  annotations:
+    agentforge.io/placeholder: "true"
+    agentforge.io/warning: "empty values; populate out of band before use"
+type: Opaque
+stringData:
+  {{- range .Values.secrets.keys }}
+  {{ . }}: ""
+  {{- end }}
+{{- end }}

@@ -1,0 +1,317 @@
+# Default values for AgentForge. Production-shaped; values-dev.yaml shrinks it.
+#
+# NOTHING IN THIS FILE IS A CREDENTIAL. Every secret is referenced by the *name*
+# of a key inside an externally-created Kubernetes Secret. See secrets.* below
+# and the runbook in deploy/README.md.
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  registry: docker.io
+  pullPolicy: IfNotPresent
+  # e.g. [{name: regcred}] for a private registry
+  pullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}   # e.g. IRSA / Workload Identity bindings
+
+# Applied to every pod in the chart.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# ---------------------------------------------------------------------------
+# Secrets: referenced, never created with values.
+# ---------------------------------------------------------------------------
+secrets:
+  # The Secret the pods read via envFrom. Create it out of band:
+  #   kubectl create secret generic agentforge-secrets \
+  #     --from-literal=ANTHROPIC_API_KEY=... --from-literal=POSTGRES_DSN=...
+  existingSecret: agentforge-secrets
+
+  # Renders an all-empty Secret with these keys so `kubectl edit secret` has
+  # something to fill in. Off by default: an empty Secret in source control is
+  # one `helm upgrade` away from clobbering real values.
+  createPlaceholder: false
+
+  # Key names only. Values live in the Secret, never here.
+  keys:
+    - ANTHROPIC_API_KEY
+    - OPENAI_API_KEY
+    - GEMINI_API_KEY
+    - GROQ_API_KEY
+    - POSTGRES_DSN          # embeds a password, so it is a secret in full
+    - REDIS_URL             # ditto when the datastore requires auth
+    - QDRANT_API_KEY
+    - WEB_ADMIN_PASSWORD
+    - LANGSMITH_API_KEY
+    - LANGWATCH_API_KEY
+    - ARIZE_API_KEY
+    - ARIZE_SPACE_ID
+    - REDTEAM_TARGET_TOKEN
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration -> ConfigMap, mounted with envFrom.
+# ---------------------------------------------------------------------------
+config:
+  LOG_LEVEL: "INFO"
+  APP_ENV: "production"
+
+  ANTHROPIC_MODEL: "claude-sonnet-4-5"
+  OPENAI_MODEL: "gpt-4o"
+  GEMINI_MODEL: "gemini-2.0-flash"
+  GROQ_MODEL: "llama-3.3-70b-versatile"
+  LLM_TIMEOUT_S: "60"
+  LLM_RETRIES: "2"
+  LLM_MAX_TOKENS: "2048"
+  ALLOW_STUB_PROVIDER: "false"   # never true in production
+
+  SESSION_TTL_S: "3600"
+  CACHE_TTL_S: "900"
+  CACHE_SIMILARITY_THRESHOLD: "0.85"
+  EMBEDDING_DIM: "384"
+
+  GUARDRAILS_LLM_TIER: "true"
+  GUARDRAILS_BLOCK_THRESHOLD: "0.6"
+
+  RAG_TOP_K_DENSE: "20"
+  RAG_TOP_K_FINAL: "5"
+  RAG_RERANK: "true"
+
+  WEB_ADMIN_USER: "admin"
+  WEB_COOKIE_SECURE: "true"      # the ingress terminates TLS
+
+# ---------------------------------------------------------------------------
+# Observability. Credentials come from the Secret; only routing lives here.
+# ---------------------------------------------------------------------------
+tracing:
+  enabled: true
+  serviceName: agentforge-api
+  langsmithProject: agentforge
+  # Endpoints are overridable because vendor paths change; verify against
+  # current docs before rollout. Blank means "use the code default".
+  langsmithEndpoint: ""
+  langwatchEndpoint: ""
+  arizeEndpoint: ""
+  # Point at an OTel Collector instead, if you would rather the app hold no
+  # vendor credentials at all.
+  otlpEndpoint: ""
+
+# ---------------------------------------------------------------------------
+# API service
+# ---------------------------------------------------------------------------
+api:
+  enabled: true
+  image:
+    repository: agentforge/api
+    tag: ""            # defaults to .Chart.AppVersion
+  replicaCount: 3
+  service:
+    type: ClusterIP
+    port: 8000
+  containerPort: 8000
+  podAnnotations: {}
+  extraEnv: []
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  # /health touches Redis and Postgres, so it is a readiness signal, not a
+  # liveness one -- a datastore blip must not trigger a restart loop.
+  livenessProbe:
+    httpGet: {path: /health, port: http}
+    initialDelaySeconds: 20
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    httpGet: {path: /health, port: http}
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  startupProbe:
+    httpGet: {path: /health, port: http}
+    periodSeconds: 5
+    failureThreshold: 30      # tolerate a slow first connect to datastores
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+    behavior:
+      scaleDown:
+        # A pipeline run can take minutes; scaling down eagerly would kill
+        # in-flight work on every traffic dip.
+        stabilizationWindowSeconds: 300
+        policies:
+          - type: Percent
+            value: 50
+            periodSeconds: 60
+      scaleUp:
+        stabilizationWindowSeconds: 30
+        policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 30
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Admin console
+# ---------------------------------------------------------------------------
+web:
+  enabled: true
+  image:
+    repository: agentforge/web
+    tag: ""
+  replicaCount: 2
+  service:
+    type: ClusterIP
+    port: 8200
+  containerPort: 8200
+  podAnnotations: {}
+  extraEnv: []
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  # The console's own /api/health needs a session, so probe the login page --
+  # it is unauthenticated and proves the app is serving.
+  livenessProbe:
+    httpGet: {path: /login, port: http}
+    initialDelaySeconds: 15
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 6
+  readinessProbe:
+    httpGet: {path: /login, port: http}
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Red-team suite: a CronJob, because it is a batch run that exits with a code.
+# ---------------------------------------------------------------------------
+redteam:
+  enabled: true
+  image:
+    repository: agentforge/redteam
+    tag: ""
+  schedule: "0 3 * * *"           # nightly, cluster timezone
+  concurrencyPolicy: Forbid       # never overlap two attack runs
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  backoffLimit: 0                 # a failing gate is a result, not a flake
+  activeDeadlineSeconds: 3600
+  # MUST be a staging target. redteam/safety.py refuses production-shaped
+  # hostnames regardless of what is set here.
+  targetUrl: ""
+  blockRateMin: "0.9"
+  attemptsPerCategory: "0"        # 0 = whole corpus
+  args: []
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi                 # PyRIT's dependency tree is heavy
+
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"    # SSE streams
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+  hosts:
+    - host: agentforge.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+          service: web
+        - path: /pipeline
+          pathType: Prefix
+          service: api
+        - path: /health
+          pathType: Prefix
+          service: api
+  tls:
+    - secretName: agentforge-tls
+      hosts:
+        - agentforge.example.com
+
+# ---------------------------------------------------------------------------
+# Datastores. enabled=true runs one in-cluster; enabled=false expects a managed
+# service, whose connection string you put in the Secret.
+# ---------------------------------------------------------------------------
+postgres:
+  enabled: true
+  image: pgvector/pgvector:pg17
+  port: 5432
+  database: agentforge
+  username: agentforge
+  # Password comes from the Secret key below -- never from values.
+  passwordSecretKey: POSTGRES_PASSWORD
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClassName: ""
+  resources:
+    requests: {cpu: 250m, memory: 1Gi}
+    limits: {cpu: "2", memory: 4Gi}
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  port: 6379
+  persistence:
+    enabled: false      # STM and the semantic cache are both regenerable
+    size: 8Gi
+    storageClassName: ""
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
+
+qdrant:
+  enabled: true
+  image: qdrant/qdrant:v1.12.4
+  port: 6333
+  persistence:
+    enabled: true
+    size: 30Gi
+    storageClassName: ""
+  resources:
+    requests: {cpu: 250m, memory: 1Gi}
+    limits: {cpu: "2", memory: 4Gi}

@@ -17,13 +17,23 @@ dependencies = [
     "redis>=5.2",           # STM + semantic cache
     "psycopg[binary]>=3.2", # pgvector LTM (the vector type lives in Postgres)
     "qdrant-client>=1.12",  # RAG vector store; embedded local mode needs no server
-    "pyrit>=1.0.1",         # red-team attack orchestration (Phase 3)
+    # Tracing. One OTLP exporter serves LangSmith, LangWatch and Arize alike,
+    # so three destinations cost two packages rather than three vendor SDKs.
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
 ]
 
 [project.optional-dependencies]
+# PyRIT drags in ~44 packages (torch, transformers, datasets, av, pyodbc). Only
+# the red-team worker needs them, so it is an extra: the API and console images
+# stay small, and `pip install .[redteam]` builds the worker.
+redteam = [
+    "pyrit>=1.0.1",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pyrit>=1.0.1",   # the red-team tests import it
 ]
 # Cross-encoder reranking. Kept optional because sentence-transformers pulls
 # torch (~2GB); rag/rerank.py falls back to a lexical reranker when absent.
