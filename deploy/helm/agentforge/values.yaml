@@ -62,6 +62,11 @@ secrets:
     - ARIZE_API_KEY
     - ARIZE_SPACE_ID
     - REDTEAM_TARGET_TOKEN
+    # Alerting channels (Phase 7). The webhook URL is itself the credential.
+    - SLACK_WEBHOOK_URL
+    - SMTP_USERNAME
+    - SMTP_PASSWORD
+    - PAGERDUTY_ROUTING_KEY
 
 # ---------------------------------------------------------------------------
 # Non-secret configuration -> ConfigMap, mounted with envFrom.
@@ -93,6 +98,25 @@ config:
 
   WEB_ADMIN_USER: "admin"
   WEB_COOKIE_SECURE: "true"      # the ingress terminates TLS
+
+  # Alert thresholds and routing (Phase 7). Non-secret by design: these are
+  # tuning knobs an operator should be able to read from the ConfigMap.
+  SMTP_HOST: ""
+  SMTP_PORT: "587"
+  SMTP_USE_TLS: "true"
+  ALERT_EMAIL_FROM: ""
+  ALERT_EMAIL_TO: ""
+  ALERT_DEDUP_WINDOW_S: "900"
+  ALERT_SILENCE_DEFAULT_S: "3600"
+  ALERT_GUARDRAIL_RATE_MAX: "0.3"
+  ALERT_GUARDRAIL_MIN_SAMPLES: "5"
+  ALERT_ESCALATION_RATE_MAX: "0.25"
+  ALERT_ESCALATION_MIN_SAMPLES: "5"
+  ALERT_BREAKER_FAILURES: "3"
+  ALERT_REDTEAM_SEVERITY: "critical"
+  # Shared suppression, so the console and the sweep CronJob agree on what is
+  # muted. "memory" is single-process and wrong for a multi-pod install.
+  ALERT_STATE_BACKEND: "redis"
 
 # ---------------------------------------------------------------------------
 # Observability. Credentials come from the Secret; only routing lives here.
@@ -245,6 +269,91 @@ redteam:
     limits:
       cpu: "2"
       memory: 4Gi                 # PyRIT's dependency tree is heavy
+
+# ---------------------------------------------------------------------------
+# Alert sweep (Phase 7). Evaluates the trajectory-window rules on a schedule.
+# The red-team block-rate rule is NOT here -- it fires from the red-team
+# CronJob, immediately after that job's own threshold check.
+# ---------------------------------------------------------------------------
+monitoring:
+  enabled: true
+  image:
+    repository: agentforge/monitoring
+    tag: ""
+  schedule: "*/15 * * * *"        # often enough to catch a spike inside an hour
+  concurrencyPolicy: Forbid       # two overlapping sweeps would double-alert
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  backoffLimit: 1
+  activeDeadlineSeconds: 600
+  # How many recent trajectories each sweep evaluates.
+  sweepLimit: "200"
+  # "redis" shares dedup/silence/ack with the console pod. "memory" resets
+  # every run -- correct only for a one-off local invocation.
+  stateBackend: redis
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+# ---------------------------------------------------------------------------
+# Self-hosted observability backends. See templates/observability.yaml for why
+# these three are not equally deployable -- LangSmith self-hosted is
+# Enterprise-licensed and has no manifest here.
+# ---------------------------------------------------------------------------
+observability:
+  enabled: false
+  phoenix:
+    enabled: true
+    image:
+      repository: arizephoenix/phoenix
+      tag: latest
+    env: []
+    # Not the chart-wide contexts: those pin uid 10001, which is this
+    # project's user, not a promise a third-party image keeps.
+    podSecurityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+    resources:
+      requests:
+        cpu: 100m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 2Gi
+  langwatch:
+    # OFF by default: it needs its own Postgres, Redis and OpenSearch, and
+    # enabling it without them is a CrashLoopBackOff, not a deployment.
+    enabled: false
+    replicaCount: 1
+    image:
+      repository: langwatch/langwatch
+      tag: latest
+    # Create this out of band with the connection strings LangWatch needs.
+    existingSecret: langwatch-secrets
+    podSecurityContext:
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+    resources:
+      requests:
+        cpu: 200m
+        memory: 1Gi
+      limits:
+        cpu: "2"
+        memory: 4Gi
 
 # ---------------------------------------------------------------------------
 # Ingress

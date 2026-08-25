@@ -1,0 +1,162 @@
+{{- /*
+Self-hosted observability backends.
+
+Read this before enabling anything here. The three vendors are NOT equally
+self-hostable, and pretending otherwise would produce manifests that cannot
+work:
+
+  * Arize Phoenix  -- genuinely self-hostable. One open-source container,
+                      OTLP ingest + UI. Enabled by default when
+                      observability.enabled is true.
+  * LangWatch      -- self-hostable, open source, but it is a full application
+                      with its own Postgres, Redis and OpenSearch
+                      dependencies. Shipped here as a Deployment you point at
+                      external datastores. OFF by default, because switching
+                      it on without those datastores gets you a CrashLoopBackOff.
+  * LangSmith      -- NOT deployable from this chart. Self-hosted LangSmith is
+                      an Enterprise-licensed product distributed via
+                      LangChain's own Helm chart and requires a licence key.
+                      There is no manifest here because there is no honest one
+                      to write. Use LangSmith Cloud (the default in
+                      app/tracing.py), or install their chart separately and
+                      point tracing.langsmithEndpoint at it.
+
+These are alternatives to the SaaS endpoints in app/tracing.py, not additions:
+enabling one means pointing the matching tracing.*Endpoint at the in-cluster
+Service, e.g.
+  tracing.arizeEndpoint: http://<release>-phoenix:6006/v1/traces
+*/ -}}
+{{- if .Values.observability.enabled }}
+{{- if .Values.observability.phoenix.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentforge.fullname" . }}-phoenix
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: phoenix
+spec:
+  replicas: 1   # Phoenix keeps trace state per-instance; do not scale it out.
+  selector:
+    matchLabels:
+      {{- include "agentforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: phoenix
+  template:
+    metadata:
+      labels:
+        {{- include "agentforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: phoenix
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Deliberately NOT the chart-wide podSecurityContext: that pins uid 10001,
+      # which is this project's application user and not a contract a
+      # third-party image honours.
+      securityContext: {{- toYaml .Values.observability.phoenix.podSecurityContext | nindent 8 }}
+      containers:
+        - name: phoenix
+          image: "{{ .Values.observability.phoenix.image.repository }}:{{ .Values.observability.phoenix.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.observability.phoenix.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 6006
+            - name: otlp-grpc
+              containerPort: 4317
+          {{- with .Values.observability.phoenix.env }}
+          env: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.observability.phoenix.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentforge.fullname" . }}-phoenix
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: phoenix
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "agentforge.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: phoenix
+  ports:
+    - name: http
+      port: 6006
+      targetPort: http
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+{{- end }}
+
+{{- if .Values.observability.langwatch.enabled }}
+---
+# Requires Postgres, Redis and OpenSearch to already exist and be referenced
+# through the Secret named below. This chart does not stand those up for you --
+# the in-chart datastores in datastores.yaml belong to AgentForge itself and
+# sharing them with a second application is not something to do by accident.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agentforge.fullname" . }}-langwatch
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: langwatch
+spec:
+  replicas: {{ .Values.observability.langwatch.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "agentforge.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: langwatch
+  template:
+    metadata:
+      labels:
+        {{- include "agentforge.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: langwatch
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.observability.langwatch.podSecurityContext | nindent 8 }}
+      containers:
+        - name: langwatch
+          image: "{{ .Values.observability.langwatch.image.repository }}:{{ .Values.observability.langwatch.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.observability.langwatch.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+          # Connection strings and the app secret live in a Secret you create
+          # out of band, exactly like AgentForge's own credentials.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.observability.langwatch.existingSecret }}
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 15
+          resources: {{- toYaml .Values.observability.langwatch.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentforge.fullname" . }}-langwatch
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: langwatch
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "agentforge.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: langwatch
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+{{- end }}
+{{- end }}

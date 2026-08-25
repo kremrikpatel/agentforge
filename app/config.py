@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 def _env(name: str, default: str = "") -> str:
@@ -86,6 +87,22 @@ class Settings:
 
     # --- App ---------------------------------------------------------------
     log_level: str = field(default_factory=lambda: _env("LOG_LEVEL", "INFO"))
+
+    # --- Agentic OS --------------------------------------------------------
+    # Root of the kernel/persona/command files. Defaults to the packaged
+    # agentos/ directory; point it elsewhere to run a customized OS without
+    # touching the code.
+    os_dir: str = field(
+        default_factory=lambda: _env(
+            "AGENTFORGE_OS_DIR",
+            str(Path(__file__).resolve().parents[1] / "agentos"),
+        )
+    )
+    os_journal: bool = field(default_factory=lambda: _env_bool("OS_JOURNAL", True))
+
+
+def _default_os_dir() -> str:
+    return str(Path(__file__).resolve().parents[1] / "agentos")
 
 
 def get_settings() -> Settings:

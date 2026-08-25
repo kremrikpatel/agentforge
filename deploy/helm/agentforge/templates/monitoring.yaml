@@ -1,0 +1,57 @@
+{{- if .Values.monitoring.enabled }}
+# The alert sweep. A CronJob for the same reason the red-team suite is one: it
+# evaluates a window of trajectories, sends whatever fired, and exits.
+#
+# This closes the gap the README calls out -- the trajectory-window rules
+# (guardrail intervention rate, escalation rate, circuit-breaker trips) need
+# something to invoke them periodically. The red-team block-rate rule does not
+# run here; it fires from inside the red-team CronJob, right after its own
+# threshold check.
+#
+# Suppression state (dedup window, silences, acknowledgements) must be shared
+# with the console pod, so ALERT_STATE_BACKEND defaults to redis. With it set
+# to "memory" every job gets a fresh pod, the dedup window resets on every run,
+# and an acknowledgement made in the console suppresses nothing here.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "agentforge.fullname" . }}-monitoring
+  labels:
+    {{- include "agentforge.labels" . | nindent 4 }}
+    app.kubernetes.io/component: monitoring
+spec:
+  schedule: {{ .Values.monitoring.schedule | quote }}
+  concurrencyPolicy: {{ .Values.monitoring.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.monitoring.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.monitoring.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ .Values.monitoring.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.monitoring.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "agentforge.labels" . | nindent 12 }}
+            app.kubernetes.io/component: monitoring
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "agentforge.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext: {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: monitoring
+              image: {{ include "agentforge.image" (dict "ctx" . "image" .Values.monitoring.image) }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext: {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              args: ["sweep", "--limit", {{ .Values.monitoring.sweepLimit | quote }}]
+              envFrom: {{- include "agentforge.envFrom" . | nindent 16 }}
+              env:
+                - name: ALERT_STATE_BACKEND
+                  value: {{ .Values.monitoring.stateBackend | quote }}
+                {{- include "agentforge.derivedEnv" . | nindent 16 }}
+              resources: {{- toYaml .Values.monitoring.resources | nindent 16 }}
+              volumeMounts: {{- include "agentforge.tmpMount" . | nindent 16 }}
+          volumes: {{- include "agentforge.tmpVolume" . | nindent 12 }}
+{{- end }}

@@ -103,6 +103,8 @@ defaults in [`.env.example`](.env.example).
 | `CACHE_SIMILARITY_THRESHOLD` | `0.85` | Cosine above which a rephrase is a hit |
 | `GUARDRAILS_LLM_TIER` | `false` | Tier 3 costs an LLM call |
 | `GUARDRAILS_BLOCK_THRESHOLD` | `0.6` | Risk score that blocks a request |
+| `AGENTFORGE_OS_DIR` | packaged `agentos/` | Kernel/persona/command file root |
+| `OS_JOURNAL` | `true` | Append run records to `agentos/data/journal/` |
 | `LOG_LEVEL` | `INFO` | Structured JSON to stdout |
 
 ## How the pieces work
@@ -139,6 +141,58 @@ three fail open.
 **Instrumentation.** Every node emits a `NodeTrace` — reasoning summary, tool calls,
 provider, latency, success/failure, guardrail verdicts — logged as JSON and returned
 in the report. That is the trajectory shape later phases train on.
+
+## Agentic OS layer
+
+The agents are personas, not prompt constants. `agentos/` is a small operating
+layer around the pipeline: declarative kernel routing, persona files you can
+edit without touching code, named command workflows that run stage subsets, and
+an append-only journal of runs.
+
+```
+agentos/
+├── kernel.md            TOML frontmatter (name, team charter, routing table) + identity
+├── personas/*.md        one specialist agent per file (frontmatter = config, body = charter)
+├── commands/*.md        named workflows: an ordered stage subset + cache policy
+└── data/journal/        runs.jsonl + decisions.jsonl (append-only; git-ignored)
+```
+
+A persona file pairs configuration with identity text:
+
+```markdown
++++
+name = "Ana"
+role = "Analyst"
+stage = "analysis"
+
+[model]
+temperature = 0.2
+
+[routing]
+triggers = ["analyze", "requirements"]
++++
+
+You are Ana, the Analyst. You open the pipeline. ...
+```
+
+At startup the API loads the kernel, personas and commands from
+`AGENTFORGE_OS_DIR` (default: the packaged `agentos/`). Each node's system
+prompt becomes *shared team charter* + *persona charter*, and each persona's
+`[model]` block overrides temperature/max-tokens for its calls. If the directory
+is missing or broken, the pipeline falls back to the built-in prompts — the OS
+degrades, it never takes the API down.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /os/agents` | The persona registry as currently loaded |
+| `GET /os/kernel` | Kernel identity, routing rules, commands |
+| `POST /os/dispatch {"task": "..."}` | Route free-form text; returns the stages/command that would run |
+| `POST /os/reload` | Hot-reload persona/kernel/command files |
+
+Two run knobs ride on `POST /pipeline/run`: `"command": "analysis-only"` runs a
+named workflow's subset, or `"stages": ["analysis"]` picks an explicit set.
+Partial runs skip the semantic cache (it is topic-keyed only) and report
+`completed` when every requested stage finished.
 
 ## RAG subsystem (Phase 2)
 
@@ -740,6 +794,154 @@ untouched.
 **Local development is unchanged** — `docker compose up` still works exactly as
 in Phase 1.
 
+## Monitoring & alerting (Phase 7)
+
+Phase 6 wired tracing/metrics export to LangSmith, LangWatch and Arize but
+built no alerting on top of it. This phase adds that layer: native alerts
+where a vendor dashboard already owns the signal, custom rules in
+`monitoring/` for the signals that cut across tools.
+
+### Native vs. custom
+
+| Alert | Owner | Why |
+|---|---|---|
+| LLM-as-judge score drops below threshold | **LangSmith** (native) | LangSmith already scores every run; the signal lives entirely in its dashboard |
+| Agent trajectory anomalies / latency spikes | **LangWatch** (native) | LangWatch's Triggers read the same OTel spans `app/tracing.py` exports |
+| Model drift / evaluation regressions | **Arize** (native) | Arize Monitors are the tool built for this signal |
+| Guardrail intervention rate spike | **AgentForge custom** | Cross-cutting: reads `Trajectory.reward.guardrail_interventions`, no single vendor owns it |
+| Red-team block-rate drop | **AgentForge custom** | Wraps `redteam/thresholds.py`'s existing CI gate |
+| Circuit-breaker trips | **AgentForge custom** | Proxied from trajectory data -- see note below |
+| Pipeline failure/escalation rate spike | **AgentForge custom** | Reads `Trajectory.reward.escalated`/`.resolution` |
+
+None of the three vendors' alerting is reliably scriptable via a stable
+public API without live credentials to verify against, and adding a vendor
+SDK for it would be a new dependency this phase doesn't need -- so native
+alerts are configured by hand:
+
+- **LangSmith**: project settings → Alerts → new alert on the feedback key
+  your judge writes (e.g. `correctness`), condition "average below
+  threshold" over your review window.
+- **LangWatch**: project → Triggers → new trigger on `latency` or the
+  evaluation checks your judge runs, condition "spike" or "below threshold".
+- **Arize**: space → Monitors → new Drift or Performance monitor on the
+  model/version tag `app/tracing.py` sets (`service.name`,
+  `deployment.environment`).
+
+### Custom rules (`monitoring/`)
+
+| Rule | Signal | Severity | Env var |
+|---|---|---|---|
+| `guardrail_intervention_rate` | share of trajectories with ≥1 guardrail intervention | warning | `ALERT_GUARDRAIL_RATE_MAX` |
+| `escalation_rate` | share of trajectories escalated, halted, or failed | warning | `ALERT_ESCALATION_RATE_MAX` |
+| `circuit_breaker_trips` | N+ consecutive `tool_call` failures for the same action name | critical | `ALERT_BREAKER_FAILURES` |
+| `redteam_block_rate` | any category below `redteam/thresholds.py`'s gate | critical | `ALERT_REDTEAM_SEVERITY` |
+
+**`circuit_breaker_trips` is a proxy, not a real breaker.** `actions/registry.py`
+only versions action definitions today -- there is no trip counter to read.
+The rule infers a "trip" from repeated `tool_call` failures in trajectory
+data instead. Replace it with a real signal if `actions/` ever grows one.
+
+The first three rules evaluate over a window of recent trajectories, so
+something has to invoke them periodically. Locally that is:
+
+```bash
+python -m monitoring.cli sweep --limit 200
+```
+
+In a cluster it is the `monitoring` CronJob (below). `redteam_block_rate`
+needs no sweep: `redteam/runner.py` calls it directly right after
+`check_thresholds`, so a CI run sends a real alert on failure instead of
+only a non-zero exit code.
+
+### Where alert state lives
+
+Two backends, because the two kinds of state have different lifetimes:
+
+| State | Backend | Why |
+|---|---|---|
+| Dedup window, silences, acknowledgements | **Redis** (`ALERT_STATE_BACKEND=redis`) | TTL-shaped and must be *shared*. `SET NX EX` is the dedup decision itself, so it stays correct when the CronJob pod and the console pod evaluate at once. |
+| Alert history (what fired, when, delivered where) | **Postgres** (`alerts` table) | Append-only and queryable; it is what the console lists. Self-created via `ensure_schema()`, so no `db/` migration. |
+
+This matters more than it looks. With `ALERT_STATE_BACKEND=memory`, a
+CronJob gets a fresh pod every run — the dedup window resets each time, and
+an acknowledgement made in the console suppresses nothing in the sweep.
+Both backends fail open: if Redis is unreachable the sweep notifies rather
+than staying silent, because a duplicate alert beats a dropped one.
+
+### Console
+
+The admin console gets an **Alerts** tab (`web/templates/app.html`,
+`web/static/app.js`) listing recent alerts with severity, delivery
+channels, and current suppression state, plus Silence / Acknowledge /
+Un-mute buttons. The endpoints live in `monitoring/api.py` and are mounted
+into the Phase 4 app exactly like Phase 5's inspection routes, so they
+inherit its `require_admin` session auth rather than inventing a second one:
+
+| Route | Purpose |
+|---|---|
+| `GET /api/alerts` | History rows, each overlaid with its Redis suppression flags |
+| `POST /api/alerts/{fingerprint}/silence` | Mute for a bounded window (7 days max) |
+| `POST /api/alerts/{fingerprint}/acknowledge` | Mute until explicitly cleared |
+| `DELETE /api/alerts/{fingerprint}/suppression` | Un-mute |
+
+### Deployment
+
+```bash
+docker build -f deploy/docker/monitoring.Dockerfile -t agentforge/monitoring:0.1.0 .
+```
+
+The chart adds a `monitoring` **CronJob** (`monitoring.enabled`, default
+every 15 minutes) that runs the sweep — the same batch-job-with-an-exit
+shape as the red-team worker, not a Deployment. It does *not* install the
+`redteam` extra: `redteam.thresholds` only needs `redteam.schemas`, so
+PyRIT stays out of this image.
+
+Alerting credentials are referenced by key name from the Secret you create
+out of band (`SLACK_WEBHOOK_URL`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
+`PAGERDUTY_ROUTING_KEY`); thresholds and routing are non-secret and live in
+the ConfigMap. **No credential appears in any values file.**
+
+### Self-hosting the observability tools
+
+`observability.enabled` (default **off**) adds in-cluster backends. The
+three vendors are not equally self-hostable, and the chart says so rather
+than shipping manifests that cannot work:
+
+| Tool | In the chart? | Notes |
+|---|---|---|
+| **Arize Phoenix** | ✅ Deployment + Service | Open source, single container, OTLP ingest on 4317 and UI on 6006. On by default when `observability.enabled`. |
+| **LangWatch** | ⚠️ Deployment + Service, **off by default** | Open source but needs its own Postgres, Redis and OpenSearch. Enabling it without them is a CrashLoopBackOff, not a deployment. |
+| **LangSmith** | ❌ Not included | Self-hosted LangSmith is Enterprise-licensed and ships via LangChain's own Helm chart. There is no honest manifest to write here — use LangSmith Cloud, or install their chart and point `tracing.langsmithEndpoint` at it. |
+
+Self-hosted backends are *alternatives* to the SaaS endpoints, not
+additions: enabling one means pointing the matching `tracing.*Endpoint` at
+the in-cluster Service, e.g.
+`tracing.arizeEndpoint: http://<release>-phoenix:6006/v1/traces`.
+
+### Notification channels
+
+Slack (`SLACK_WEBHOOK_URL`, via `httpx` -- already a core dependency) and
+email (`SMTP_*`, via stdlib `smtplib`) are wired; PagerDuty
+(`PAGERDUTY_ROUTING_KEY`) is a stub behind the same `Notifier` interface that
+logs "not implemented" instead of paging anyone. Routing is severity-based:
+warning → Slack only; critical → Slack + email + the PagerDuty stub. A
+channel with no credentials configured (or the PagerDuty stub) is simply a
+no-op, the same "absent, not degraded" pattern `app/tracing.py` uses for
+missing vendor keys.
+
+### Alert hygiene
+
+`monitoring/dedup.py` keys on each alert's fingerprint: a condition that
+keeps firing inside `ALERT_DEDUP_WINDOW_S` (default 900s) sends one
+notification, not one per evaluation. `silence(fingerprint, duration_s)`
+suppresses it for a window; `acknowledge(fingerprint)` suppresses it until
+`clear(fingerprint)`. Both are reachable from the console's Alerts tab.
+
+Fingerprint is the *condition*, not the alert instance — which is why
+`circuit_breaker_trips` sets it per action name
+(`circuit_breaker_trips:create_ticket`). Silencing one flaky action does
+not mute the rule for every other action.
+
 ## Deliberate Phase 1 simplifications
 
 Each is marked with a `ponytail:` comment at its site, naming the ceiling and the
@@ -775,6 +977,7 @@ and set `QDRANT_URL=http://qdrant:6333` on the `api` service.
 ```
 app/        config, structured logging + event bus, JSON extraction, FastAPI, UI
 agents/     contracts, prompts + node execution, LangGraph wiring
+agentos/    kernel routing, persona files, command workflows, run journal
 gateway/    provider adapters, fallback chain + retry policy
 guardrails/ regex tier, classifier tier, three-tier fusion engine
 memory/     embedder, Redis STM, pgvector LTM, semantic cache
@@ -784,9 +987,11 @@ redteam/    attack corpus, PyRIT targets, scoring, threshold gate, dashboard
 web/        admin console: session auth, agent configs, run history, BFF, UI
 instrumentation/  trajectory capture, PII scrubbing, audit log, versioning
 actions/    versioned action definitions (no execution runtime yet)
+monitoring/ alert rules, severity routing, Slack/email notifiers, Redis-backed
+            dedup + silence, Postgres alert history, console API, sweep CLI
 deploy/     Dockerfiles per service + Helm chart (K8s 1.28+) + runbook
 tests/      graph routing, gateway fallback, guardrails, memory, retrieval,
-            red team, console API, instrumentation, tracing
+            red team, console API, instrumentation, tracing, monitoring
 db/         initial pgvector schema
 ```
 

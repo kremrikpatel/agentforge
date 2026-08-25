@@ -19,13 +19,23 @@ _FATAL_STATUS = {400, 401, 403, 404, 422}
 
 
 class ProviderError(Exception):
+    """A provider call that failed, carrying whether trying again could help.
+
+    The `retryable` flag is the whole reason this type exists: the gateway needs
+    to tell "this vendor is briefly unwell" from "this request will never work",
+    and only the adapter that made the call knows which it saw.
+    """
+
     def __init__(self, message: str, *, retryable: bool) -> None:
+        """Record the verdict alongside the message so callers cannot lose it."""
         super().__init__(message)
         self.retryable = retryable
 
 
 @dataclass(frozen=True)
 class GatewayRequest:
+    """One vendor-neutral completion request, shaped to the smallest common API."""
+
     system: str
     user: str
     max_tokens: int = 2048
@@ -37,6 +47,8 @@ class GatewayRequest:
 
 @dataclass(frozen=True)
 class LLMResponse:
+    """A completion plus what it cost to get: which provider, how many tries."""
+
     text: str
     provider: str
     model: str
@@ -46,25 +58,39 @@ class LLMResponse:
 
 
 class BaseProvider(abc.ABC):
+    """Shared HTTP plumbing; subclasses supply only credentials and payload shape.
+
+    Keeping the retryable/fatal classification and the defensive response
+    unwrapping here means a new vendor cannot accidentally get either wrong.
+    """
+
     name: str = "base"
 
     def __init__(self, settings: Settings) -> None:
+        """Hold settings rather than the key, so a re-read of config takes effect."""
         self.settings = settings
 
     @property
     @abc.abstractmethod
-    def api_key(self) -> str: ...
+    def api_key(self) -> str:
+        """The configured credential, or empty string when this vendor is unset."""
 
     @property
     @abc.abstractmethod
-    def model(self) -> str: ...
+    def model(self) -> str:
+        """The model id this adapter will ask for."""
 
     def available(self) -> bool:
         """A blank key means 'not configured' -- skip without burning a retry."""
         return bool(self.api_key)
 
     @abc.abstractmethod
-    async def complete(self, req: GatewayRequest, client: httpx.AsyncClient) -> str: ...
+    async def complete(self, req: GatewayRequest, client: httpx.AsyncClient) -> str:
+        """Translate the request into this vendor's dialect and return the text.
+
+        Takes a caller-owned client so connection reuse and timeouts are decided
+        once by the gateway rather than five times over in the adapters.
+        """
 
     async def _post(self, client: httpx.AsyncClient, url: str, **kwargs) -> dict:
         try:
@@ -103,18 +129,23 @@ class BaseProvider(abc.ABC):
 
 
 class AnthropicProvider(BaseProvider):
+    """Anthropic Messages API -- system prompt is a top-level field, not a message."""
+
     name = "anthropic"
     url = "https://api.anthropic.com/v1/messages"
 
     @property
     def api_key(self) -> str:
+        """Return the configured Anthropic key."""
         return self.settings.anthropic_api_key
 
     @property
     def model(self) -> str:
+        """Return the configured Anthropic model id."""
         return self.settings.anthropic_model
 
     async def complete(self, req: GatewayRequest, client: httpx.AsyncClient) -> str:
+        """Post one message turn; treat an empty completion as worth retrying."""
         data = await self._post(
             client,
             self.url,
@@ -143,6 +174,7 @@ class _OpenAICompatible(BaseProvider):
     url = ""
 
     async def complete(self, req: GatewayRequest, client: httpx.AsyncClient) -> str:
+        """Post the shared chat-completions body; subclasses differ only in URL."""
         data = await self._post(
             client,
             self.url,
@@ -167,44 +199,57 @@ class _OpenAICompatible(BaseProvider):
 
 
 class OpenAIProvider(_OpenAICompatible):
+    """OpenAI chat completions."""
+
     name = "openai"
     url = "https://api.openai.com/v1/chat/completions"
 
     @property
     def api_key(self) -> str:
+        """Return the configured OpenAI key."""
         return self.settings.openai_api_key
 
     @property
     def model(self) -> str:
+        """Return the configured OpenAI model id."""
         return self.settings.openai_model
 
 
 class GroqProvider(_OpenAICompatible):
+    """Groq: last real link in the chain, so it catches whatever the others drop."""
+
     name = "groq"
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     @property
     def api_key(self) -> str:
+        """Return the configured Groq key."""
         return self.settings.groq_api_key
 
     @property
     def model(self) -> str:
+        """Return the configured Groq model id."""
         return self.settings.groq_model
 
 
 class GeminiProvider(BaseProvider):
+    """Google Generative Language API -- model id rides in the path, key in a header."""
+
     name = "gemini"
     base = "https://generativelanguage.googleapis.com/v1beta/models"
 
     @property
     def api_key(self) -> str:
+        """Return the configured Gemini key."""
         return self.settings.gemini_api_key
 
     @property
     def model(self) -> str:
+        """Return the configured Gemini model id."""
         return self.settings.gemini_model
 
     async def complete(self, req: GatewayRequest, client: httpx.AsyncClient) -> str:
+        """Send the key as a header rather than a query param -- URLs get logged."""
         data = await self._post(
             client,
             f"{self.base}/{self.model}:generateContent",
@@ -235,13 +280,20 @@ class StubProvider(BaseProvider):
 
     @property
     def api_key(self) -> str:
+        """Fake a key when stubbing is allowed; empty otherwise so `available` says no."""
         return "stub" if self.settings.allow_stub_provider else ""
 
     @property
     def model(self) -> str:
+        """Name the absence of a model, so a trace shows plainly nothing was called."""
         return "offline-deterministic"
 
     async def complete(self, req: GatewayRequest, client: httpx.AsyncClient) -> str:
+        """Echo the caller's payload; a missing one is fatal, not retryable.
+
+        Retrying would spin forever -- no amount of waiting makes a caller supply
+        an offline payload it never had.
+        """
         if not req.stub_response:
             raise ProviderError("stub: caller supplied no offline payload", retryable=False)
         return req.stub_response
@@ -258,4 +310,5 @@ DEFAULT_CHAIN: tuple[type[BaseProvider], ...] = (
 
 
 def build_chain(settings: Settings) -> list[BaseProvider]:
+    """Build every provider, configured or not -- `available` does the filtering."""
     return [cls(settings) for cls in DEFAULT_CHAIN]

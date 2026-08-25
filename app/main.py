@@ -6,14 +6,22 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
-from agents.contracts import PipelineReport, PipelineRequest
+from agents.contracts import (
+    STAGE_ORDER,
+    PipelineReport,
+    PipelineRequest,
+    Stage,
+)
 from agents.graph import build_graph, initial_state, to_report
 from agents.nodes import AgentDeps
+from agentos.journal import Journal
+from agentos.loader import AgentOS
 from app.config import get_settings
 from app.observability import EVENT_BUS, configure_logging, get_logger, log_event, timed
 from app.tracing import configure_tracing, set_attributes, shutdown_tracing, span
@@ -25,6 +33,38 @@ from memory.stm import SessionMemory
 
 logger = get_logger("agentforge.api")
 STATIC_DIR = Path(__file__).parent / "static"
+
+
+def resolve_stages(req: PipelineRequest, os_registry: AgentOS) -> tuple[Stage, ...]:
+    """Explicit stages > command workflow > full pipeline, in canonical order."""
+    if req.stages:
+        wanted = set(req.stages)
+        return tuple(s for s in STAGE_ORDER if s in wanted) or tuple(STAGE_ORDER)
+    if req.command:
+        cmd = os_registry.command(req.command)
+        if cmd is None:
+            raise HTTPException(
+                status_code=404, detail=f"unknown command: {req.command}"
+            )
+        return tuple(cmd.ordered_stages())
+    return tuple(STAGE_ORDER)
+
+
+def get_graph(state, stages: tuple[Stage, ...]):
+    """One compiled graph per stage subset; nodes share the app's deps."""
+    cache: dict[tuple[Stage, ...], Any] = state.graphs
+    if stages not in cache:
+        cache[stages] = build_graph(
+            AgentDeps(
+                gateway=state.gateway,
+                guardrails=state.guardrails,
+                stm=state.stm,
+                ltm=state.ltm,
+                personas=state.os,
+            ),
+            stages=stages,
+        )
+    return cache[stages]
 
 
 @asynccontextmanager
@@ -41,14 +81,12 @@ async def lifespan(app: FastAPI):
     app.state.stm = SessionMemory(settings)
     app.state.ltm = LongTermMemory(settings)
     app.state.cache = SemanticCache(settings)
-    app.state.graph = build_graph(
-        AgentDeps(
-            gateway=gateway,
-            guardrails=app.state.guardrails,
-            stm=app.state.stm,
-            ltm=app.state.ltm,
-        )
-    )
+
+    # OS layer: personas + kernel + commands, loaded from disk (hot-reloadable).
+    app.state.os = AgentOS(Path(settings.os_dir))
+    app.state.journal = Journal(Path(settings.os_dir)) if settings.os_journal else None
+    app.state.graphs = {}
+    app.state.graph = get_graph(app.state, tuple(STAGE_ORDER))
 
     # Backends are optional: the pipeline degrades rather than refusing to start.
     schema_ok = await app.state.ltm.ensure_schema()
@@ -103,8 +141,18 @@ async def health(request: Request) -> dict:
 async def run_pipeline(req: PipelineRequest, request: Request) -> PipelineReport:
     state = request.app.state
     run_id = req.run_id
+    enabled = resolve_stages(req, state.os)
+    full_run = enabled == tuple(STAGE_ORDER)
 
-    if not req.bypass_cache:
+    # The semantic cache is keyed by topic alone, so only cacheable full runs
+    # consult it: serving a cached partial report for a different stage subset
+    # would lie about what ran.
+    command = state.os.command(req.command) if req.command else None
+    use_cache = full_run and not req.bypass_cache and not (
+        command is not None and command.bypass_cache
+    )
+
+    if use_cache:
         cached, kind, similarity = await state.cache.get(req.topic)
         if cached is not None:
             cached["cached"] = True
@@ -118,7 +166,16 @@ async def run_pipeline(req: PipelineRequest, request: Request) -> PipelineReport
                 # Stale shape from an older build -- drop it and run for real.
                 await state.cache.invalidate(req.topic)
 
-    EVENT_BUS.publish(run_id, {"type": "run_start", "run_id": run_id, "topic": req.topic})
+    EVENT_BUS.publish(
+        run_id,
+        {
+            "type": "run_start",
+            "run_id": run_id,
+            "topic": req.topic,
+            "stages": [s.value for s in enabled],
+            **({"command": req.command} if req.command else {}),
+        },
+    )
     with span(
         "agentforge.pipeline.run",
         **{
@@ -128,8 +185,9 @@ async def run_pipeline(req: PipelineRequest, request: Request) -> PipelineReport
             "gen_ai.operation.name": "chain",
         },
     ) as run_span, timed() as t:
-        final = await state.graph.ainvoke(initial_state(run_id, req.session_id, req.topic))
-        report = to_report(final)
+        graph = get_graph(request.app.state, enabled)
+        final = await graph.ainvoke(initial_state(run_id, req.session_id, req.topic))
+        report = to_report(final, expected=enabled)
         set_attributes(
             run_span,
             **{
@@ -144,7 +202,8 @@ async def run_pipeline(req: PipelineRequest, request: Request) -> PipelineReport
         )
 
     if report.status == "completed":
-        await state.cache.set(req.topic, report.model_dump(mode="json"))
+        if full_run and not req.bypass_cache:
+            await state.cache.set(req.topic, report.model_dump(mode="json"))
         if report.deploy is not None:
             await state.ltm.remember(
                 session_id=req.session_id,
@@ -153,6 +212,18 @@ async def run_pipeline(req: PipelineRequest, request: Request) -> PipelineReport
                 stage="deploy",
                 content=report.deploy.handoff.summary,
             )
+        if (
+            state.journal is not None
+            and report.test is not None
+            and report.test.verdict == "fail"
+        ):
+            state.journal.log_decision(
+                "qa-fail-escalation",
+                {"run_id": run_id, "topic": req.topic[:200]},
+            )
+
+    if state.journal is not None:
+        state.journal.log_run(report.model_dump(mode="json"))
 
     EVENT_BUS.publish(
         run_id,
@@ -207,3 +278,57 @@ async def session_history(session_id: str, request: Request) -> dict:
     if not turns:
         raise HTTPException(status_code=404, detail="no history for this session")
     return {"session_id": session_id, "turns": turns}
+
+
+# --------------------------------------------------------------------------
+# OS layer: registry inspection, kernel routing, command dispatch, reload.
+# --------------------------------------------------------------------------
+
+
+@app.get("/os/agents")
+async def os_agents(request: Request) -> dict:
+    """The persona registry as currently loaded."""
+    return request.app.state.os.summary()
+
+
+@app.get("/os/kernel")
+async def os_kernel(request: Request) -> dict:
+    state = request.app.state
+    kernel = state.os.kernel
+    return {
+        "name": kernel.name,
+        "identity": kernel.identity,
+        "team_charter": kernel.team_charter,
+        "routing": [r.model_dump(mode="json") for r in kernel.routing],
+        "commands": [c.id for c in state.os.commands.values()],
+        "sources": state.os.sources,
+    }
+
+
+class DispatchRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=4000)
+
+
+@app.post("/os/dispatch")
+async def os_dispatch(body: DispatchRequest, request: Request) -> dict:
+    """Route a free-form task through the kernel and say what would run.
+
+    Read-only: it returns the routing decision (stages/command) so a client
+    can pass it to /pipeline/run; it never executes the pipeline itself.
+    """
+    decision = request.app.state.os.route(body.task)
+    payload = decision.model_dump(mode="json")
+    payload["stages"] = [s.value for s in decision.stages]
+    return payload
+
+
+@app.post("/os/reload")
+async def os_reload(request: Request) -> dict:
+    """Re-read kernel/personas/commands from disk into the running process."""
+    state = request.app.state
+    state.os.reload()
+    # Persona charters may have changed: compiled graphs capture prompts only
+    # at call time, but drop cached graphs anyway so subsets rebuild cleanly.
+    state.graphs.clear()
+    log_event(logger, "os.reloaded", agents=len(state.os.personas))
+    return {"reloaded": True, "agents": len(state.os.personas), "commands": len(state.os.commands)}
