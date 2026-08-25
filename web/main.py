@@ -347,6 +347,11 @@ from instrumentation.api import router as instrumentation_router  # noqa: E402
 
 app.include_router(instrumentation_router)
 
+# Phase 7 alerting endpoints (/api/alerts). Mounted for the same reason.
+from monitoring.api import router as monitoring_router  # noqa: E402
+
+app.include_router(monitoring_router)
+
 
 @app.exception_handler(HTTPException)
 async def _json_errors(request: Request, exc: HTTPException) -> Response:

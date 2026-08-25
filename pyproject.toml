@@ -45,14 +45,15 @@ rerank = [
 # Flat layout with several top-level packages, so list them rather than relying
 # on auto-discovery (which refuses to guess and picks up `db/` and `tests/`).
 packages = [
-    "app", "agents", "gateway", "guardrails", "memory",
-    "rag", "redteam", "web", "instrumentation", "actions",
+    "app", "agents", "agentos", "gateway", "guardrails", "memory",
+    "rag", "redteam", "web", "instrumentation", "actions", "monitoring",
 ]
 
 [tool.setuptools.package-data]
 app = ["static/*.html"]
 redteam = ["static/*.html"]
 web = ["templates/*.html", "static/*"]
+agentos = ["*.md", "personas/*.md", "commands/*.md"]
 
 [tool.pytest.ini_options]
 # Flat top-level packages (app, agents, gateway, memory, guardrails) resolve from

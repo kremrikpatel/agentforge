@@ -18,7 +18,7 @@ from typing import Annotated, TypedDict
 from langgraph.graph import END, StateGraph
 
 from agents.contracts import STAGE_ORDER, PipelineReport, Stage
-from agents.nodes import AgentDeps, make_node, next_stage
+from agents.nodes import AgentDeps, make_node
 
 
 def _merge_stages(left: dict, right: dict) -> dict:
@@ -53,9 +53,14 @@ def initial_state(run_id: str, session_id: str, topic: str) -> PipelineState:
     }
 
 
-def route_after(stage: Stage):
-    """Continue to the next agent, unless the run has halted."""
-    nxt = next_stage(stage)
+def route_after(stage: Stage, enabled: tuple[Stage, ...] = STAGE_ORDER):
+    """Continue to the next *enabled* agent, unless the run has halted.
+
+    Disabled stages are skipped, which is how commands and explicit stage
+    subsets produce partial runs without a separate graph shape.
+    """
+    remaining = [s for s in enabled if STAGE_ORDER.index(s) > STAGE_ORDER.index(stage)]
+    nxt = remaining[0] if remaining else None
 
     def _route(state: PipelineState) -> str:
         if state.get("halted"):
@@ -66,25 +71,33 @@ def route_after(stage: Stage):
     return _route
 
 
-def build_graph(deps: AgentDeps):
+def build_graph(deps: AgentDeps, stages: tuple[Stage, ...] = STAGE_ORDER):
     graph = StateGraph(PipelineState)
 
-    for stage in STAGE_ORDER:
+    for stage in stages:
         graph.add_node(stage.value, make_node(stage, deps))
 
-    graph.set_entry_point(STAGE_ORDER[0].value)
-    for stage in STAGE_ORDER:
-        nxt = next_stage(stage)
-        targets = {END: END} if nxt is None else {nxt.value: nxt.value, END: END}
-        graph.add_conditional_edges(stage.value, route_after(stage), targets)
+    graph.set_entry_point(stages[0].value)
+    for stage in stages:
+        nxt = route_after(stage, stages)
+        targets = {END: END}
+        # Only wire a forward edge when some stage actually follows this one.
+        following = [
+            s for s in stages if STAGE_ORDER.index(s) > STAGE_ORDER.index(stage)
+        ]
+        if following:
+            targets[following[0].value] = following[0].value
+        graph.add_conditional_edges(stage.value, nxt, targets)
 
     return graph.compile()
 
 
-def to_report(state: PipelineState) -> PipelineReport:
+def to_report(state: PipelineState, expected: tuple[Stage, ...] = STAGE_ORDER) -> PipelineReport:
+    """Assemble the report. A run is 'completed' when every *expected* stage
+    produced its contract -- intentional partial runs are not halts."""
     stages = state.get("stages", {})
     errors = state.get("errors", [])
-    completed = all(s.value in stages for s in STAGE_ORDER)
+    completed = all(s.value in stages for s in expected)
 
     if completed and not errors:
         status = "completed"

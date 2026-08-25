@@ -16,6 +16,7 @@
       <button class="nav" data-panel="agent">Agent</button>
       <button class="nav" data-panel="knowledge">Knowledge</button>
       <button class="nav" data-panel="redteam">Red team</button>
+      <button class="nav" data-panel="alerts">Alerts</button>
     </nav>
     <div class="sidebar-foot">
       <div class="who">{{ user }}</div>
@@ -112,6 +113,15 @@
       </header>
       <div class="cards" id="rt-cards"></div>
       <div id="rt-failures"></div>
+    </section>
+
+    <!-- Alerts (Phase 7 monitoring) -->
+    <section class="panel" data-panel="alerts">
+      <header>
+        <h2>Alerts</h2>
+        <button class="link" id="alerts-refresh">Refresh</button>
+      </header>
+      <div id="alerts-rows"></div>
     </section>
   </main>
 </div>

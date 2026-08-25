@@ -107,7 +107,18 @@ a.link { color:var(--accent); text-decoration:none; font-size:12.5px; }
 .pill { font-size:10.5px; padding:2px 8px; border-radius:20px; border:1px solid var(--line); }
 .pill.completed, .pill.blocked { color:var(--ok); border-color:#1c5c2e; }
 .pill.halted { color:var(--warn); border-color:#6b5115; }
-.pill.failed, .pill.leaked { color:var(--bad); border-color:#6e2a26; }
+.pill.failed, .pill.leaked, .pill.critical { color:var(--bad); border-color:#6e2a26; }
+.pill.warning { color:var(--warn); border-color:#6b5115; }
+
+/* Alerts (Phase 7). A muted row stays visible but recedes -- an operator
+   needs to see that a condition is still firing while silenced. */
+.al-row { border-bottom:1px solid var(--line); padding:10px 2px; }
+.al-row summary { cursor:pointer; display:flex; align-items:center; gap:8px; }
+.al-muted { opacity:0.55; }
+.al-state { font-size:10.5px; color:var(--dim); text-transform:uppercase; letter-spacing:0.06em; }
+.al-body { padding:8px 0 2px 4px; }
+.al-meta { font-size:11.5px; color:var(--dim); margin:6px 0; }
+.al-actions { display:flex; gap:14px; }
 
 /* --- detail + red team ---------------------------------------------- */
 details { border:1px solid var(--line); border-radius:8px; margin-top:10px; background:var(--panel); }

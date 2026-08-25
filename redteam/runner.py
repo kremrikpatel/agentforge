@@ -281,6 +281,13 @@ async def main_async(argv: list[str] | None = None) -> int:
     result = check_thresholds(summary, threshold)
     print()
     print(result.report())
+
+    # Lazy import: redteam has no hard dependency on monitoring being
+    # configured, same "off unless set up" contract app/tracing.py uses.
+    from monitoring.engine import notify_redteam_result
+
+    await notify_redteam_result(result)
+
     return result.exit_code
 
 

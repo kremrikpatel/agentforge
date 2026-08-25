@@ -30,6 +30,7 @@ document.querySelectorAll(".nav").forEach((btn) => {
     document.querySelector(`.panel[data-panel="${btn.dataset.panel}"]`).classList.add("active");
     if (btn.dataset.panel === "history") loadHistory();
     if (btn.dataset.panel === "redteam") loadRedTeam();
+    if (btn.dataset.panel === "alerts") loadAlerts();
     if (btn.dataset.panel === "agent") loadConfigs();
   };
 });
@@ -329,5 +330,76 @@ async function loadRedTeam() {
     $("rt-cards").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
 }
+
+/* ------------------------------------------------------------- alerts */
+/* Rows come from the Postgres alert log; the suppression flags on each row
+   come from Redis, so a row shows both what fired and whether it is muted. */
+let alertSilenceDefault = 3600;
+
+function alertRow(a) {
+  const s = a.suppression || {};
+  const state = s.acknowledged ? "acknowledged" : s.silenced ? "silenced" : "";
+  const channels = (a.channels || []).join(", ") || "not delivered";
+  const fp = esc(a.fingerprint);
+  return `<details class="al-row${state ? " al-muted" : ""}">
+    <summary>
+      <span class="pill ${esc(a.severity)}">${esc(a.severity)}</span>
+      ${esc(a.summary)}
+      ${state ? `<span class="al-state">${esc(state)}</span>` : ""}
+    </summary>
+    <div class="al-body">
+      <pre>${esc(a.detail || "")}</pre>
+      <div class="al-meta">
+        <code>${fp}</code> · fired ${esc(String(a.fired_at))} · sent to ${esc(channels)}
+      </div>
+      <div class="al-actions">
+        <button class="link" data-alert-action="silence" data-fingerprint="${fp}">Silence</button>
+        <button class="link" data-alert-action="acknowledge" data-fingerprint="${fp}">Acknowledge</button>
+        <button class="link" data-alert-action="clear" data-fingerprint="${fp}">Un-mute</button>
+      </div>
+    </div>
+  </details>`;
+}
+
+async function loadAlerts() {
+  try {
+    const d = await api("/api/alerts");
+    alertSilenceDefault = d.silence_default_s || alertSilenceDefault;
+    const rows = d.alerts || [];
+    $("alerts-rows").innerHTML = rows.length
+      ? rows.map(alertRow).join("")
+      : `<div class="empty">No alerts have fired — run
+         <code>python -m monitoring.cli sweep</code>.</div>`;
+  } catch (err) {
+    $("alerts-rows").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+  }
+}
+
+/* Delegated so the handler survives every re-render of the list. */
+$("alerts-rows").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-alert-action]");
+  if (!button) return;
+  event.preventDefault();
+
+  const fingerprint = encodeURIComponent(button.dataset.fingerprint);
+  const action = button.dataset.alertAction;
+  try {
+    if (action === "silence") {
+      await api(`/api/alerts/${fingerprint}/silence`, {
+        method: "POST",
+        body: JSON.stringify({ duration_s: alertSilenceDefault }),
+      });
+    } else if (action === "acknowledge") {
+      await api(`/api/alerts/${fingerprint}/acknowledge`, { method: "POST" });
+    } else {
+      await api(`/api/alerts/${fingerprint}/suppression`, { method: "DELETE" });
+    }
+    await loadAlerts();
+  } catch (err) {
+    $("alerts-rows").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+  }
+});
+
+$("alerts-refresh").onclick = loadAlerts;
 
 loadConfigs().catch(() => {});

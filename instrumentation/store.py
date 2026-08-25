@@ -145,27 +145,54 @@ class ScrubbingStore:
 
 @runtime_checkable
 class InstrumentationStore(Protocol):
+    """The surface both backends implement, so callers never branch on which is live.
+
+    Deliberately narrow and write-mostly: everything the API layer needs, nothing
+    that would let a caller mutate an observed step after the fact.
+    """
+
     name: str
 
-    async def ensure_schema(self) -> bool: ...
-    async def save_trajectory(self, trajectory: Trajectory) -> Trajectory: ...
-    async def get_trajectory(self, run_id: str) -> Trajectory | None: ...
-    async def list_trajectories(self, limit: int = 50) -> list[dict[str, Any]]: ...
+    async def ensure_schema(self) -> bool:
+        """Create the tables if absent; False means the backend is unreachable."""
+
+    async def save_trajectory(self, trajectory: Trajectory) -> Trajectory:
+        """Persist a run and return the scrubbed copy that was actually stored."""
+
+    async def get_trajectory(self, run_id: str) -> Trajectory | None:
+        """Return one run with its steps, or None when the id is unknown."""
+
+    async def list_trajectories(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return newest-first summary rows -- no steps, this feeds a list view."""
+
     async def set_feedback(
         self, run_id: str, feedback: str, note: str
-    ) -> Trajectory | None: ...
-    async def append_audit(self, entry: AuditEntry) -> AuditEntry: ...
-    async def list_audit(self, limit: int = 100, **filters: str) -> list[dict[str, Any]]: ...
-    async def save_version(self, record: VersionRecord) -> VersionRecord: ...
+    ) -> Trajectory | None:
+        """Attach a user verdict to a finished run; the one revisable field."""
+
+    async def append_audit(self, entry: AuditEntry) -> AuditEntry:
+        """Record who changed what, scrubbed, and return the stored entry."""
+
+    async def list_audit(self, limit: int = 100, **filters: str) -> list[dict[str, Any]]:
+        """Return newest-first audit rows, narrowed by any of the known filters."""
+
+    async def save_version(self, record: VersionRecord) -> VersionRecord:
+        """Append one immutable snapshot of an entity."""
+
     async def latest_version(
         self, entity_type: EntityType, entity_id: str
-    ) -> VersionRecord | None: ...
+    ) -> VersionRecord | None:
+        """Return the highest-numbered snapshot, or None if the entity has none."""
+
     async def get_version(
         self, entity_type: EntityType, entity_id: str, version: int
-    ) -> VersionRecord | None: ...
+    ) -> VersionRecord | None:
+        """Return one exact snapshot, or None when that version was never written."""
+
     async def list_versions(
         self, entity_type: EntityType, entity_id: str
-    ) -> list[VersionRecord]: ...
+    ) -> list[VersionRecord]:
+        """Return every snapshot for an entity in ascending version order."""
 
 
 def _traj_row(t: Trajectory) -> dict[str, Any]:
@@ -183,18 +210,28 @@ def _traj_row(t: Trajectory) -> dict[str, Any]:
 
 
 class InMemoryInstrumentationStore(ScrubbingStore):
+    """Process-local fallback so a dead Postgres degrades the platform, not stops it.
+
+    It scrubs on write exactly as the Postgres store does. That is not redundancy
+    for its own sake: tests run against this backend, so any hole in the scrubbing
+    contract would go unnoticed if the fallback took a shortcut.
+    """
+
     name = "memory"
 
     def __init__(self) -> None:
+        """Start empty; `_order` tracks insertion so listing stays newest-first."""
         self.trajectories: dict[str, Trajectory] = {}
         self._order: list[str] = []
         self.audit: list[AuditEntry] = []
         self.versions: list[VersionRecord] = []
 
     async def ensure_schema(self) -> bool:
+        """Always ready -- dicts need no migration."""
         return True
 
     async def save_trajectory(self, trajectory: Trajectory) -> Trajectory:
+        """Scrub, then upsert by run id, keeping first-seen order for the list view."""
         cleaned = self._prepare_trajectory(trajectory)
         if cleaned.run_id not in self.trajectories:
             self._order.insert(0, cleaned.run_id)
@@ -202,12 +239,19 @@ class InMemoryInstrumentationStore(ScrubbingStore):
         return cleaned
 
     async def get_trajectory(self, run_id: str) -> Trajectory | None:
+        """Return the stored run, already scrubbed at write time."""
         return self.trajectories.get(run_id)
 
     async def list_trajectories(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return summary rows newest-first, matching the Postgres row shape."""
         return [_traj_row(self.trajectories[r]) for r in self._order[:limit]]
 
     async def set_feedback(self, run_id: str, feedback: str, note: str) -> Trajectory | None:
+        """Copy-then-write the reward so a handle held elsewhere never mutates.
+
+        The note is scrubbed here rather than trusted: feedback is free text
+        typed by a user and is the likeliest place for PII to enter the store.
+        """
         existing = self.trajectories.get(run_id)
         if existing is None:
             return None
@@ -219,11 +263,13 @@ class InMemoryInstrumentationStore(ScrubbingStore):
         return updated
 
     async def append_audit(self, entry: AuditEntry) -> AuditEntry:
+        """Prepend so the list is already newest-first without a sort."""
         cleaned = self._prepare_audit(entry)
         self.audit.insert(0, cleaned)
         return cleaned
 
     async def list_audit(self, limit: int = 100, **filters: str) -> list[dict[str, Any]]:
+        """Filter by any known field, ignoring the rest -- unknown keys are not errors."""
         rows = self.audit
         for key in ("entity_type", "entity_id", "actor", "action"):
             wanted = filters.get(key)
@@ -232,6 +278,7 @@ class InMemoryInstrumentationStore(ScrubbingStore):
         return [e.model_dump(mode="json") for e in rows[:limit]]
 
     async def save_version(self, record: VersionRecord) -> VersionRecord:
+        """Append only -- a snapshot is never edited, superseded ones stay put."""
         cleaned = self._prepare_version(record)
         self.versions.append(cleaned)
         return cleaned
@@ -239,12 +286,18 @@ class InMemoryInstrumentationStore(ScrubbingStore):
     async def latest_version(
         self, entity_type: EntityType, entity_id: str
     ) -> VersionRecord | None:
+        """Take the tail of the sorted list rather than trusting append order.
+
+        A rollback writes a *new* highest version, so insertion order and version
+        order agree today -- but sorting keeps that an implementation detail.
+        """
         candidates = await self.list_versions(entity_type, entity_id)
         return candidates[-1] if candidates else None
 
     async def get_version(
         self, entity_type: EntityType, entity_id: str, version: int
     ) -> VersionRecord | None:
+        """Linear scan for one exact snapshot; the list stays small per entity."""
         return next(
             (
                 v
@@ -259,6 +312,7 @@ class InMemoryInstrumentationStore(ScrubbingStore):
     async def list_versions(
         self, entity_type: EntityType, entity_id: str
     ) -> list[VersionRecord]:
+        """Return this entity's snapshots in ascending version order."""
         return sorted(
             (
                 v
@@ -270,15 +324,26 @@ class InMemoryInstrumentationStore(ScrubbingStore):
 
 
 class PostgresInstrumentationStore(ScrubbingStore):
+    """Durable backend that fails open: a dead database loses telemetry, not requests.
+
+    Every method swallows `psycopg.Error`/`OSError` and returns the in-memory
+    value it would have written. Instrumentation is a bystander to the agent run
+    -- letting it raise would mean an outage in the observability layer takes the
+    product down with it. The cost is stated plainly by `degraded`, and the first
+    failure is logged once so the logs do not drown in a repeating error.
+    """
+
     name = "postgres"
 
     def __init__(self, settings: Settings | None = None) -> None:
+        """Hold settings only; the connection is opened per call, not pooled here."""
         self.settings = settings or get_settings()
         self._degraded = False
         self._warned = False
 
     @property
     def degraded(self) -> bool:
+        """True once a write has been silently dropped -- reads may be incomplete."""
         return self._degraded
 
     def _note(self, op: str, exc: Exception) -> None:
@@ -293,6 +358,7 @@ class PostgresInstrumentationStore(ScrubbingStore):
         )
 
     async def ensure_schema(self) -> bool:
+        """Apply the idempotent DDL; a False here is what selects the memory backend."""
         try:
             async with await self._connect() as conn:
                 await conn.execute(SCHEMA)
@@ -303,6 +369,12 @@ class PostgresInstrumentationStore(ScrubbingStore):
         return True
 
     async def save_trajectory(self, trajectory: Trajectory) -> Trajectory:
+        """Upsert the run head, then insert steps ignoring ids already present.
+
+        A run is saved repeatedly as it progresses, so the head takes the newer
+        values while steps use DO NOTHING -- an observed step is a fact, and
+        re-sending it must never rewrite what was recorded the first time.
+        """
         cleaned = self._prepare_trajectory(trajectory)
         try:
             async with await self._connect() as conn:
@@ -351,6 +423,11 @@ class PostgresInstrumentationStore(ScrubbingStore):
         return cleaned
 
     async def get_trajectory(self, run_id: str) -> Trajectory | None:
+        """Reassemble a run from its head row plus ordered steps.
+
+        Two queries in one transaction rather than a join: a join would repeat
+        the head across every step row, and the head carries the JSONB reward.
+        """
         try:
             async with await self._connect(autocommit=False) as conn:
                 cur = await conn.execute(
@@ -395,6 +472,12 @@ class PostgresInstrumentationStore(ScrubbingStore):
         )
 
     async def list_trajectories(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Project the summary row in SQL, digging the reward fields out of JSONB.
+
+        Pulling `resolution` and `implicit_score` with `->>` keeps this a single
+        indexed scan of the head table; hydrating full models to read two numbers
+        would fetch every step for a list view that shows none.
+        """
         try:
             async with await self._connect(autocommit=False) as conn:
                 cur = await conn.execute(
@@ -417,6 +500,12 @@ class PostgresInstrumentationStore(ScrubbingStore):
         return [{k: v for k, v in zip(keys, r)} for r in rows]
 
     async def set_feedback(self, run_id: str, feedback: str, note: str) -> Trajectory | None:
+        """Rewrite the reward blob -- the single sanctioned UPDATE in this store.
+
+        Feedback arrives long after the run ended, so it cannot be an append. It
+        lives in its own column precisely so the observed steps stay untouched.
+        The note is scrubbed before it goes anywhere near the database.
+        """
         existing = await self.get_trajectory(run_id)
         if existing is None:
             return None
@@ -434,6 +523,7 @@ class PostgresInstrumentationStore(ScrubbingStore):
         return existing
 
     async def append_audit(self, entry: AuditEntry) -> AuditEntry:
+        """Insert one entry, ignoring a duplicate id so a retry cannot double-log."""
         cleaned = self._prepare_audit(entry)
         try:
             async with await self._connect() as conn:
@@ -458,6 +548,12 @@ class PostgresInstrumentationStore(ScrubbingStore):
         return cleaned
 
     async def list_audit(self, limit: int = 100, **filters: str) -> list[dict[str, Any]]:
+        """Build the WHERE clause from a fixed key list, never from caller strings.
+
+        Only the four known column names can reach the SQL text; their values go
+        through placeholders. Interpolating `filters` directly would hand an API
+        caller the query.
+        """
         clauses, params = [], []
         for key in ("entity_type", "entity_id", "actor", "action"):
             if filters.get(key):
@@ -486,6 +582,12 @@ class PostgresInstrumentationStore(ScrubbingStore):
         return [{k: v for k, v in zip(keys, r)} for r in rows]
 
     async def save_version(self, record: VersionRecord) -> VersionRecord:
+        """Append a snapshot; a repeat of an existing version number is a no-op.
+
+        DO NOTHING rather than DO UPDATE is the whole point of version history --
+        a racing writer must lose the number, not silently overwrite the payload
+        another version already claimed.
+        """
         cleaned = self._prepare_version(record)
         try:
             async with await self._connect() as conn:
@@ -537,6 +639,7 @@ class PostgresInstrumentationStore(ScrubbingStore):
     async def latest_version(
         self, entity_type: EntityType, entity_id: str
     ) -> VersionRecord | None:
+        """Return the highest version number, which a rollback also becomes."""
         rows = await self._versions_query(
             entity_type, entity_id, "ORDER BY version DESC LIMIT 1", ()
         )
@@ -545,6 +648,7 @@ class PostgresInstrumentationStore(ScrubbingStore):
     async def get_version(
         self, entity_type: EntityType, entity_id: str, version: int
     ) -> VersionRecord | None:
+        """Return one exact snapshot -- the read a rollback makes before it writes."""
         rows = await self._versions_query(
             entity_type, entity_id, "AND version = %s", (version,)
         )
@@ -553,6 +657,7 @@ class PostgresInstrumentationStore(ScrubbingStore):
     async def list_versions(
         self, entity_type: EntityType, entity_id: str
     ) -> list[VersionRecord]:
+        """Return the full history oldest-first, so a diff view reads forwards."""
         rows = await self._versions_query(entity_type, entity_id, "ORDER BY version", ())
         return [self._to_version(r) for r in rows]
 

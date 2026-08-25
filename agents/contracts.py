@@ -207,6 +207,10 @@ class PipelineRequest(BaseModel):
     # Optional so a client can subscribe to the event stream before the run starts.
     run_id: str = Field(default_factory=new_id)
     bypass_cache: bool = False
+    # OS layer: run a named command workflow or an explicit stage subset.
+    # Explicit stages win when both are set. None means all four stages.
+    command: str | None = None
+    stages: list[Stage] | None = None
 
 
 class GuardrailFinding(BaseModel):
