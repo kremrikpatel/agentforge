@@ -16,7 +16,14 @@ still works exactly as it did in Phase 1; nothing here modifies it.
 
 ## 1. Build and push images
 
-Build from the **repository root** (the Dockerfiles reference `-f`):
+**Using a tagged release?** Skip this step. Every `v*` tag publishes all four
+images to `ghcr.io/<owner>/agentforge/<service>` and the chart to
+`oci://ghcr.io/<owner>/charts` (see [CONTRIBUTING.md](../CONTRIBUTING.md#releases)).
+Set `REGISTRY=ghcr.io/<owner>` and go to step 2.
+
+Build from the **repository root** (the Dockerfiles reference `-f`). Image names
+must be `$REGISTRY/agentforge/<service>`, because the chart pulls
+`{image.registry}/agentforge/<service>`:
 
 ```bash
 export REGISTRY=ghcr.io/your-org
@@ -24,15 +31,17 @@ export TAG=0.1.0
 ```
 
 ```bash
-docker build -f deploy/docker/api.Dockerfile     -t $REGISTRY/agentforge-api:$TAG     .
-docker build -f deploy/docker/web.Dockerfile     -t $REGISTRY/agentforge-web:$TAG     .
-docker build -f deploy/docker/redteam.Dockerfile -t $REGISTRY/agentforge-redteam:$TAG .
+docker build -f deploy/docker/api.Dockerfile        -t $REGISTRY/agentforge/api:$TAG        .
+docker build -f deploy/docker/web.Dockerfile        -t $REGISTRY/agentforge/web:$TAG        .
+docker build -f deploy/docker/redteam.Dockerfile    -t $REGISTRY/agentforge/redteam:$TAG    .
+docker build -f deploy/docker/monitoring.Dockerfile -t $REGISTRY/agentforge/monitoring:$TAG .
 ```
 
 ```bash
-docker push $REGISTRY/agentforge-api:$TAG
-docker push $REGISTRY/agentforge-web:$TAG
-docker push $REGISTRY/agentforge-redteam:$TAG
+docker push $REGISTRY/agentforge/api:$TAG
+docker push $REGISTRY/agentforge/web:$TAG
+docker push $REGISTRY/agentforge/redteam:$TAG
+docker push $REGISTRY/agentforge/monitoring:$TAG
 ```
 
 All three are multi-stage: a builder installs into a virtualenv and only that
