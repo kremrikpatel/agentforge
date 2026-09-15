@@ -972,6 +972,13 @@ and Phase 2's scope was the `rag/` module. To run a server instead, add:
 
 and set `QDRANT_URL=http://qdrant:6333` on the `api` service.
 
+## Contributing and releases
+
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** for setup, PR checklist and conventions.
+Pushing a `v*` tag publishes the four images and the Helm chart to GitHub
+Packages (GHCR) and creates a GitHub Release. The workflow is
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ## Layout
 
 ```
